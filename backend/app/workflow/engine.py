@@ -1,0 +1,204 @@
+from __future__ import annotations
+
+import asyncio
+import inspect
+from typing import Any
+
+from .context import AdmissionMode, RunContext, RunMode, RunState, utcnow
+from .events import Command, Event, EventBus
+from .registry import NodeRegistry
+from .transitions import TransitionTable
+from .validators import NodeResultValidator
+
+
+class WorkflowConflict(RuntimeError):
+    pass
+
+
+class WorkflowEngine:
+    """Single-active-run asyncio workflow orchestrator."""
+
+    def __init__(self, registry: NodeRegistry | None = None, transitions: TransitionTable | None = None,
+                 services: Any = None, archive_service: Any = None, node_registry: NodeRegistry | None = None) -> None:
+        self.registry = registry or node_registry or NodeRegistry()
+        self.transitions = transitions or TransitionTable()
+        self.services = services
+        self.archive_service = archive_service
+        self.validator = NodeResultValidator()
+        self.contexts: dict[str, RunContext] = {}
+        self.buses: dict[str, EventBus] = {}
+        self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._commands: dict[str, asyncio.Queue[Command]] = {}
+        self._command_results: dict[tuple[str, str], Any] = {}
+        self._lock = asyncio.Lock()
+
+    @property
+    def active(self) -> RunContext | None:
+        return next((c for c in self.contexts.values() if c.current_state not in {
+            RunState.COMPLETED, RunState.FAILED, RunState.TERMINATED}), None)
+
+    async def start_run(self, *, mode: RunMode | str, admission_mode: AdmissionMode | str,
+                        seed_text: str | None = None, continuous_enabled: bool = False,
+                        strategy_snapshot: dict[str, Any] | None = None) -> RunContext:
+        async with self._lock:
+            if self.active is not None:
+                raise WorkflowConflict("an active run already exists")
+            mode, admission_mode = RunMode(mode), AdmissionMode(admission_mode)
+            if continuous_enabled and mode is not RunMode.AUTO_DISCOVERY:
+                raise ValueError("continuous execution is only allowed for AUTO_DISCOVERY")
+            context = RunContext(mode=mode, admission_mode=admission_mode, seed_text=seed_text,
+                                 continuous_enabled=continuous_enabled,
+                                 strategy_snapshot=strategy_snapshot or {})
+            context.branches[context.active_branch_id] = {"parent_branch_id": None, "origin": "ROOT"}
+            self.contexts[context.run_id] = context
+            self.buses[context.run_id] = EventBus()
+            self._commands[context.run_id] = asyncio.Queue()
+            await self._emit(context, "run.started", {"mode": mode.value})
+            task = asyncio.create_task(self._run(context))
+            self._tasks[context.run_id] = task
+            return context
+
+    async def command(self, run_id: str, command: Command) -> Any:
+        context = self.contexts.get(run_id)
+        if context is None:
+            raise KeyError(run_id)
+        cached = self._command_results.get((run_id, command.command_id))
+        if cached is not None:
+            return cached
+        if command.expected_run_version is not None and command.expected_run_version != context.run_version:
+            raise WorkflowConflict("RUN_VERSION_CONFLICT")
+        if command.type == "PAUSE":
+            context.pause_requested = True
+            context.current_state = RunState.PAUSING
+        elif command.type == "TERMINATE":
+            context.terminate_requested = True
+        elif command.type == "RESUME":
+            if context.current_state is RunState.PAUSED:
+                context.current_state = context.suspended_state or RunState.RUNNING
+                context.pause_requested = False
+        elif command.type == "SET_CONTINUOUS_EXECUTION":
+            context.continuous_enabled = bool(command.payload.get("enabled"))
+        elif command.type == "EVALUATION_SUBMITTED":
+            if context.current_state is not RunState.WAITING_HUMAN_EVALUATION:
+                raise WorkflowConflict("evaluation is not currently awaited")
+            context.pending_human_action = command.payload
+            context.current_node = "N18"
+            context.current_state = RunState.RUNNING
+        elif command.type == "SWITCH_ACTIVE_BRANCH":
+            branch_id = command.payload.get("branch_id")
+            if branch_id not in context.branches:
+                raise ValueError("unknown branch")
+            context.active_branch_id = branch_id
+        elif command.type == "CORRECT_NODE_OUTPUT":
+            branch_id = str(__import__('uuid').uuid4())
+            context.branches[branch_id] = {"parent_branch_id": context.active_branch_id,
+                                           "origin": "HUMAN_CORRECTION", "payload": command.payload}
+            context.active_branch_id = branch_id
+            context.current_node = command.payload.get("node_key", context.current_node)
+            context.current_state = RunState.RUNNING
+        elif command.type == "RETRY_NODE":
+            context.current_state = RunState.RUNNING
+        else:
+            raise ValueError(f"unsupported command: {command.type}")
+        context.run_version += 1
+        result = {"command_id": command.command_id, "accepted": True, "run_version": context.run_version}
+        self._command_results[(run_id, command.command_id)] = result
+        await self._emit(context, "command.accepted", {"command_type": command.type})
+        return result
+
+    async def submit_evaluation(self, run_id: str, evaluation: dict[str, Any], *,
+                                expected_run_version: int, branch_id: str | None = None) -> Any:
+        context = self.contexts.get(run_id)
+        if context is None:
+            raise KeyError(run_id)
+        if branch_id is not None and branch_id != context.active_branch_id:
+            raise WorkflowConflict("RUN_VERSION_CONFLICT")
+        return await self.command(run_id, Command(type="EVALUATION_SUBMITTED",
+                                                   expected_run_version=expected_run_version,
+                                                   payload=evaluation))
+
+    async def _run(self, context: RunContext) -> None:
+        try:
+            while context.current_state not in {RunState.COMPLETED, RunState.FAILED, RunState.TERMINATED}:
+                if context.terminate_requested:
+                    context.current_state, context.ended_at = RunState.TERMINATED, utcnow()
+                    await self._emit(context, "run.completed", {"status": "TERMINATED"})
+                    break
+                if context.pause_requested and context.current_state is RunState.PAUSING:
+                    context.suspended_state = RunState.RUNNING
+                    context.current_state = RunState.PAUSED
+                    context.run_version += 1
+                    await self._emit(context, "run.paused", {})
+                    await asyncio.sleep(0.05)
+                    continue
+                if context.current_state in {RunState.PAUSED, RunState.WAITING_HUMAN_INTERVENTION,
+                                              RunState.WAITING_HUMAN_EVALUATION}:
+                    await asyncio.sleep(0.05)
+                    continue
+                context.current_state = RunState.RUNNING
+                node = context.current_node
+                await self._emit(context, "node.started", {"node_key": node})
+                if node == "START":
+                    outcome, output = context.mode.value, {"mode": context.mode.value}
+                elif node == "N18" and context.pending_human_action is not None:
+                    outcome, output = "EVALUATION_SUBMITTED", context.pending_human_action
+                    context.pending_human_action = None
+                else:
+                    try:
+                        n = self.registry.get(node)
+                        # Existing node implementations may use the compact one-argument
+                        # contract; provider-backed nodes accept ``services`` as well.
+                        params = inspect.signature(n.execute).parameters
+                        result = await (n.execute(context.active_artifacts, self.services)
+                                        if len(params) >= 2 else n.execute(context.active_artifacts))  # type: ignore[call-arg]
+                        self.validator.validate(result)
+                        output = getattr(result, "artifact", getattr(result, "output", result))
+                        outcome = str(getattr(result, "outcome", None) or (result.get("outcome") if isinstance(result, dict) else "DONE"))
+                    except KeyError:
+                        # Missing production wiring is an explicit intervention, never success.
+                        context.current_state = RunState.WAITING_HUMAN_INTERVENTION
+                        await self._emit(context, "node.failed", {"node_key": node, "error": "NODE_NOT_REGISTERED"})
+                        continue
+                    except Exception as exc:
+                        context.current_state = RunState.FAILED
+                        await self._emit(context, "node.failed", {"node_key": node, "error": str(exc)})
+                        break
+                context.node_outputs[node] = output
+                context.active_artifacts[node] = output
+                await self._emit(context, "node.completed", {"node_key": node, "outcome": outcome})
+                if node == "N18" and outcome == "EVALUATION_SUBMITTED":
+                    context.current_node = "N19"
+                elif node == "N17" and outcome in {"AUTO_DECIDED", "WAIT_HUMAN_DECISION"}:
+                    context.current_node = "N18"
+                    context.current_state = RunState.WAITING_HUMAN_EVALUATION
+                    context.run_version += 1
+                    await self._emit(context, "human.required", {"node_key": "N18"})
+                    continue
+                else:
+                    nxt = self.transitions.next(node, str(outcome), mode=context.mode.value,
+                                                continuous=context.continuous_enabled)
+                    if nxt is None:
+                        context.current_state, context.ended_at = RunState.COMPLETED, utcnow()
+                        await self._emit(context, "run.completed", {"status": "COMPLETED"})
+                        if self.archive_service:
+                            await self.archive_service.archive(context)
+                        break
+                    context.current_node = nxt
+                context.run_version += 1
+                await self._emit(context, "state.changed", {"current_node": context.current_node})
+        finally:
+            self._tasks.pop(context.run_id, None)
+
+    async def _emit(self, context: RunContext, event_type: str, payload: dict[str, Any]) -> None:
+        event = Event(event_type, context.run_id, context.run_version, context.current_state.value,
+                      payload, context.active_branch_id)
+        await self.buses[context.run_id].publish(event)
+        context.event_buffer.append(event)
+        if len(context.event_buffer) > 1000:
+            del context.event_buffer[:-1000]
+
+    def snapshot(self, run_id: str) -> dict[str, Any]:
+        return self.contexts[run_id].snapshot()
+
+    def events(self, run_id: str, since: int = 0) -> tuple[list[Event], bool]:
+        return self.buses[run_id].since(since)
