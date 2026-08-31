@@ -12,6 +12,14 @@ def _payload(request: NodeLLMRequest) -> str:
 
 
 def _json_text(raw: str) -> dict[str, Any]:
+    raw = raw.strip()
+    if raw.startswith("```"):
+        lines = raw.splitlines()
+        if lines and lines[0].lstrip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        raw = "\n".join(lines).strip()
     value = json.loads(raw)
     if not isinstance(value, dict):
         raise ValueError("structured output must be a JSON object")
@@ -19,7 +27,7 @@ def _json_text(raw: str) -> dict[str, Any]:
 
 
 class OpenAIResponsesProvider:
-    def __init__(self, api_key: str, model: str, base_url: str = "https://api.openai.com/v1", timeout: float = 60, client: httpx.AsyncClient | None = None):
+    def __init__(self, api_key: str, model: str, base_url: str = "https://api.openai.com/v1", timeout: float = 180, client: httpx.AsyncClient | None = None):
         self.api_key, self.model, self.base_url, self.timeout, self._client = api_key, model, base_url.rstrip("/"), timeout, client
 
     async def generate(self, request: NodeLLMRequest) -> LLMCallResult:
@@ -42,7 +50,7 @@ class OpenAIResponsesProvider:
 
 
 class DeepSeekChatProvider:
-    def __init__(self, api_key: str, model: str, base_url: str = "https://api.deepseek.com", timeout: float = 60, client: httpx.AsyncClient | None = None):
+    def __init__(self, api_key: str, model: str, base_url: str = "https://api.deepseek.com", timeout: float = 180, client: httpx.AsyncClient | None = None):
         self.api_key, self.model, self.base_url, self.timeout, self._client = api_key, model, base_url.rstrip("/"), timeout, client
 
     async def generate(self, request: NodeLLMRequest) -> LLMCallResult:

@@ -19,11 +19,13 @@ class WorkflowEngine:
     """Single-active-run asyncio workflow orchestrator."""
 
     def __init__(self, registry: NodeRegistry | None = None, transitions: TransitionTable | None = None,
-                 services: Any = None, archive_service: Any = None, node_registry: NodeRegistry | None = None) -> None:
+                 services: Any = None, archive_service: Any = None, node_registry: NodeRegistry | None = None,
+                 repository: Any = None) -> None:
         self.registry = registry or node_registry or NodeRegistry()
         self.transitions = transitions or TransitionTable()
         self.services = services
         self.archive_service = archive_service
+        self.repository = repository
         self.validator = NodeResultValidator()
         self.contexts: dict[str, RunContext] = {}
         self.buses: dict[str, EventBus] = {}
@@ -53,6 +55,8 @@ class WorkflowEngine:
             self.contexts[context.run_id] = context
             self.buses[context.run_id] = EventBus()
             self._commands[context.run_id] = asyncio.Queue()
+            if self.repository:
+                await self.repository.create_run(context)
             await self._emit(context, "run.started", {"mode": mode.value})
             task = asyncio.create_task(self._run(context))
             self._tasks[context.run_id] = task
@@ -123,6 +127,10 @@ class WorkflowEngine:
                 if context.terminate_requested:
                     context.current_state, context.ended_at = RunState.TERMINATED, utcnow()
                     await self._emit(context, "run.completed", {"status": "TERMINATED"})
+                    if self.repository:
+                        await self.repository.archive_run(context)
+                    if self.repository:
+                        await self.repository.archive_run(context)
                     break
                 if context.pause_requested and context.current_state is RunState.PAUSING:
                     context.suspended_state = RunState.RUNNING
@@ -137,9 +145,10 @@ class WorkflowEngine:
                     continue
                 context.current_state = RunState.RUNNING
                 node = context.current_node
+                output: Any
                 await self._emit(context, "node.started", {"node_key": node})
                 if node == "START":
-                    outcome, output = context.mode.value, {"mode": context.mode.value}
+                    outcome, output = context.mode.value, {"mode": context.mode.value, "seed_text": context.seed_text}
                 elif node == "N18" and context.pending_human_action is not None:
                     outcome, output = "EVALUATION_SUBMITTED", context.pending_human_action
                     context.pending_human_action = None
@@ -149,10 +158,14 @@ class WorkflowEngine:
                         # Existing node implementations may use the compact one-argument
                         # contract; provider-backed nodes accept ``services`` as well.
                         params = inspect.signature(n.execute).parameters
-                        result = await (n.execute(context.active_artifacts, self.services)
+                        services = {"run_id": context.run_id, "repository": self.repository, "services": self.services}
+                        result = await (n.execute(context.active_artifacts, services)
                                         if len(params) >= 2 else n.execute(context.active_artifacts))  # type: ignore[call-arg]
                         self.validator.validate(result)
-                        output = getattr(result, "artifact", getattr(result, "output", result))
+                        if isinstance(result, dict):
+                            output = result.get("artifact", result.get("output", result))
+                        else:
+                            output = getattr(result, "artifact", getattr(result, "output", result))
                         outcome = str(getattr(result, "outcome", None) or (result.get("outcome") if isinstance(result, dict) else "DONE"))
                     except KeyError:
                         # Missing production wiring is an explicit intervention, never success.
@@ -162,9 +175,15 @@ class WorkflowEngine:
                     except Exception as exc:
                         context.current_state = RunState.FAILED
                         await self._emit(context, "node.failed", {"node_key": node, "error": str(exc)})
+                        if self.repository:
+                            await self.repository.archive_run(context)
                         break
                 context.node_outputs[node] = output
                 context.active_artifacts[node] = output
+                if self.repository and node != "START":
+                    await self.repository.persist_node(context, node, output, outcome)
+                if self.repository and node == "N18" and isinstance(output, dict):
+                    await self.repository.persist_evaluation(context, output)
                 await self._emit(context, "node.completed", {"node_key": node, "outcome": outcome})
                 if node == "N18" and outcome == "EVALUATION_SUBMITTED":
                     context.current_node = "N19"
@@ -180,8 +199,12 @@ class WorkflowEngine:
                     if nxt is None:
                         context.current_state, context.ended_at = RunState.COMPLETED, utcnow()
                         await self._emit(context, "run.completed", {"status": "COMPLETED"})
+                        if self.repository:
+                            await self.repository.archive_run(context)
                         if self.archive_service:
                             await self.archive_service.archive(context)
+                        elif self.repository:
+                            await self.repository.archive_run(context)
                         break
                     context.current_node = nxt
                 context.run_version += 1
@@ -193,6 +216,8 @@ class WorkflowEngine:
         event = Event(event_type, context.run_id, context.run_version, context.current_state.value,
                       payload, context.active_branch_id)
         await self.buses[context.run_id].publish(event)
+        if self.repository:
+            await self.repository.persist_event(event)
         context.event_buffer.append(event)
         if len(context.event_buffer) > 1000:
             del context.event_buffer[:-1000]

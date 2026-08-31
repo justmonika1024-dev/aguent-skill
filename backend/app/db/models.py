@@ -52,6 +52,30 @@ class RunNodeExecution(Base):
     human_summary: Mapped[str | None] = mapped_column(Text); next_state: Mapped[str | None] = mapped_column(String(64)); prompt_version: Mapped[str | None] = mapped_column(String(64)); strategy_version_id: Mapped[str] = mapped_column(String(36)); provider: Mapped[str | None] = mapped_column(String(32)); model: Mapped[str | None] = mapped_column(String(128)); parameter_snapshot_json: Mapped[dict | None] = mapped_column(JSON); token_usage_json: Mapped[dict | None] = mapped_column(JSON); cost_usd: Mapped[float | None] = mapped_column(Numeric(12, 6)); started_at: Mapped[datetime] = mapped_column(DateTime, default=now); ended_at: Mapped[datetime | None] = mapped_column(DateTime); error_code: Mapped[str | None] = mapped_column(String(64)); error_message: Mapped[str | None] = mapped_column(Text)
 
 
+class RunEvent(Base):
+    __tablename__ = "run_events"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    run_id: Mapped[str] = mapped_column(ForeignKey("run_records.id"), index=True)
+    sequence: Mapped[int] = mapped_column(Integer, index=True)
+    event_type: Mapped[str] = mapped_column(String(64))
+    run_version: Mapped[int] = mapped_column(Integer)
+    state: Mapped[str] = mapped_column(String(32))
+    branch_id: Mapped[str | None] = mapped_column(String(36))
+    payload_json: Mapped[dict] = mapped_column(JSON)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime)
+
+class RunAPICall(Base):
+    __tablename__ = "run_api_calls"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    run_id: Mapped[str] = mapped_column(ForeignKey("run_records.id"), index=True)
+    node_key: Mapped[str | None] = mapped_column(String(64), index=True)
+    api_type: Mapped[str] = mapped_column(String(16)); provider: Mapped[str] = mapped_column(String(32))
+    model: Mapped[str | None] = mapped_column(String(128)); provider_request_id: Mapped[str | None] = mapped_column(String(255))
+    input_tokens: Mapped[int | None] = mapped_column(Integer); output_tokens: Mapped[int | None] = mapped_column(Integer); total_tokens: Mapped[int | None] = mapped_column(Integer)
+    cost_usd: Mapped[float | None] = mapped_column(Numeric(12, 6)); latency_ms: Mapped[int | None] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(32), default="SUCCEEDED"); created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+
+
 def _simple(name, cols):
     table_name = cols.pop("__tablename__", name.lower())
     # Most archive tables use ``id``; the parameter-profile and singleton

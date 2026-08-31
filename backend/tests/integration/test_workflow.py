@@ -1,7 +1,9 @@
 import asyncio
 
 import pytest
+from httpx import ASGITransport, AsyncClient
 
+from app.main import app
 from app.workflow.context import AdmissionMode, RunMode, RunState
 from app.workflow.engine import WorkflowConflict, WorkflowEngine
 from app.workflow.events import Command
@@ -47,3 +49,32 @@ async def test_second_active_run_and_stale_version_are_rejected():
     with pytest.raises(WorkflowConflict):
         await engine.command(ctx.run_id, Command("PAUSE", expected_run_version=999))
 
+
+@pytest.mark.asyncio
+async def test_default_run_nodes_are_json_serializable_after_evaluation():
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        created = await client.post("/api/v1/runs", json={
+            "mode": "MANUAL_SEED", "admission_mode": "HUMAN", "seed_text": "x",
+            "continuous_enabled": False,
+        })
+        assert created.status_code == 201
+        run_id = created.json()["run_id"]
+        for _ in range(200):
+            snapshot = (await client.get(f"/api/v1/runs/{run_id}")).json()
+            if snapshot["state"] == "WAITING_HUMAN_EVALUATION":
+                break
+            await asyncio.sleep(0.001)
+        response = await client.post(f"/api/v1/runs/{run_id}/evaluation", json={
+            "expected_run_version": snapshot["run_version"],
+            "branch_id": snapshot["active_branch_id"],
+            "score": 5,
+        })
+        assert response.status_code == 200
+        for _ in range(200):
+            final_snapshot = (await client.get(f"/api/v1/runs/{run_id}")).json()
+            if final_snapshot["state"] in {"COMPLETED", "FAILED", "WAITING_HUMAN_INTERVENTION"}:
+                break
+            await asyncio.sleep(0.005)
+        nodes = await client.get(f"/api/v1/runs/{run_id}/nodes")
+        assert nodes.status_code == 200
+        assert len(nodes.json()) == 21

@@ -4,6 +4,7 @@ import pytest
 from app.providers.base import NodeLLMRequest, ParameterProfile
 from app.providers.exa import canonicalize_url
 from app.providers.fake import FakeLLMProvider
+from app.providers.llm import _json_text
 from app.workflow.nodes.contracts import (
     N03SearchPlan,
     N09EvidenceEvaluation,
@@ -37,6 +38,10 @@ def test_exa_url_cleaning_and_n03_rules():
         {"query_id": "q3", "query": "你说的对 梗", "search_type": "keyword", "purpose": "x", "priority": 3},
     ]})
     assert validate_n03_plan(plan) is plan
+
+
+def test_llm_parser_accepts_markdown_json_fence():
+    assert _json_text('```json\n{"ok": true}\n```') == {"ok": True}
 
 
 def test_n11_5_threshold_and_n12_five_candidates_contract():
