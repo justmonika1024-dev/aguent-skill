@@ -5,3 +5,7 @@ __pycache__/
 .venv/
 .env
 backend/data/*.db
+frontend/node_modules/
+frontend/dist/
+frontend/playwright-report/
+frontend/test-results/
