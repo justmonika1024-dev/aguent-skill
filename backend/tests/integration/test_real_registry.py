@@ -877,6 +877,166 @@ async def test_auto_discovery_keeps_new_fragment_from_mixed_exhausted_source():
 
 
 @pytest.mark.asyncio
+async def test_auto_discovery_keeps_new_evidence_after_exhausted_same_fragment():
+    exhausted = "我猜中了开头，却猜不中这结局"
+    alternative = "大胆妖孽，我一眼就看出你不是人"
+    context = RunContext(
+        mode=RunMode.AUTO_DISCOVERY,
+        admission_mode=AdmissionMode.AUTO,
+        strategy_snapshot={"search": {}},
+        exhausted_originals=[exhausted],
+    )
+    services = {"strategy_snapshot": context.strategy_snapshot}
+    source = SearchResult(
+        url="https://forum.example/same-fragment",
+        canonical_url="https://forum.example/same-fragment",
+        title=exhausted,
+        text=f"{exhausted}，网友还说：{alternative}。",
+    )
+    search = FakeSearchProvider(batches=[SearchBatch(results=[source])])
+    llm = FakeLLMProvider(responses=[{
+        "title": "新梗候选",
+        "original_text": alternative,
+        "fixed_anchors": ["大胆妖孽", "一眼就看出"],
+        "source_id": "O001",
+        "source_url": source.url,
+        "evidence_quote": alternative,
+    }])
+    registry = build_real_registry(llm=llm, search=search)
+
+    n04 = await registry.get("N04").execute({
+        "N03": {"queries": [{
+            "query_id": "OQ1", "query": exhausted, "search_type": "keyword",
+        }]},
+    }, services)
+
+    assert n04["outcome"] == "RESULTS_FOUND"
+    assert len(n04["artifact"]["sources"]) == 1
+    filtered_source = n04["artifact"]["sources"][0]
+    assert exhausted not in filtered_source["text"]
+    assert alternative in filtered_source["text"]
+
+    n05 = await registry.get("N05").execute({
+        "N04": {"sources": n04["artifact"]["sources"]},
+    }, services)
+
+    assert n05["outcome"] == "SELECTED"
+    assert n05["artifact"]["llm"]["original_text"] == alternative
+    assert len(llm.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_exhausted_filter_uses_canonical_single_glyph_script_identity():
+    original = "设计一个自动触发弹窗"
+    traditional = "设计一个自动觸发弹窗"
+    context = RunContext(
+        mode=RunMode.AUTO_DISCOVERY,
+        admission_mode=AdmissionMode.AUTO,
+        strategy_snapshot={"search": {}},
+        exhausted_originals=[original],
+    )
+    services = {"strategy_snapshot": context.strategy_snapshot}
+    source = SearchResult(
+        url="https://forum.example/traditional-reprint",
+        canonical_url="https://forum.example/traditional-reprint",
+        title=traditional,
+        text=traditional + "。",
+    )
+    registry = build_real_registry(
+        llm=FakeLLMProvider(),
+        search=FakeSearchProvider(batches=[SearchBatch(results=[source])]),
+    )
+
+    result = await registry.get("N04").execute({
+        "N03": {"queries": [{
+            "query_id": "OQ1", "query": original, "search_type": "keyword",
+        }]},
+    }, services)
+
+    assert result["outcome"] == "HUMAN_REVIEW_REQUIRED"
+    assert result["artifact"]["sources"] == []
+    assert result["artifact"]["rejection_reason"] == (
+        "ONLY_EXHAUSTED_ORIGINAL_EVIDENCE"
+    )
+
+
+@pytest.mark.asyncio
+async def test_n04_rejects_generic_title_after_exhausted_body_is_removed():
+    exhausted = "我猜中了开头，却猜不中这结局"
+    generic_title = "今天大家都在讨论这个话题"
+    context = RunContext(
+        mode=RunMode.AUTO_DISCOVERY,
+        admission_mode=AdmissionMode.AUTO,
+        strategy_snapshot={"search": {}},
+        exhausted_originals=[exhausted],
+    )
+    services = {"strategy_snapshot": context.strategy_snapshot}
+    source = SearchResult(
+        url="https://forum.example/generic-title",
+        canonical_url="https://forum.example/generic-title",
+        title=generic_title,
+        text=exhausted + "。",
+    )
+    registry = build_real_registry(
+        llm=FakeLLMProvider(),
+        search=FakeSearchProvider(batches=[SearchBatch(results=[source])]),
+    )
+
+    result = await registry.get("N04").execute({
+        "N03": {"queries": [{
+            "query_id": "OQ1", "query": exhausted, "search_type": "keyword",
+        }]},
+    }, services)
+
+    assert result["outcome"] == "HUMAN_REVIEW_REQUIRED"
+    assert result["artifact"]["sources"] == []
+    assert result["artifact"]["rejection_reason"] == (
+        "ONLY_EXHAUSTED_ORIGINAL_EVIDENCE"
+    )
+    assert TransitionTable().next(
+        "N04", result["outcome"], mode=RunMode.AUTO_DISCOVERY.value,
+    ) == "WAITING_HUMAN_INTERVENTION"
+
+
+@pytest.mark.asyncio
+async def test_n05_rejects_unverified_title_only_after_exhausted_body_removal():
+    exhausted = "我猜中了开头，却猜不中这结局"
+    generic_title = "今天大家都在讨论这个话题"
+    context = RunContext(
+        mode=RunMode.AUTO_DISCOVERY,
+        admission_mode=AdmissionMode.AUTO,
+        strategy_snapshot={"search": {}},
+        exhausted_originals=[exhausted],
+    )
+    services = {"strategy_snapshot": context.strategy_snapshot}
+    llm = FakeLLMProvider(responses=[{
+        "title": generic_title,
+        "original_text": generic_title,
+        "fixed_anchors": ["今天大家", "讨论话题"],
+        "source_id": "O001",
+        "source_url": "https://forum.example/generic-title",
+        "evidence_quote": generic_title,
+    }])
+    registry = build_real_registry(llm=llm, search=FakeSearchProvider())
+
+    result = await registry.get("N05").execute({
+        "N04": {"sources": [{
+            "source_id": "O001",
+            "url": "https://forum.example/generic-title",
+            "title": generic_title,
+            "text": exhausted + "。",
+        }]},
+    }, services)
+
+    assert result["outcome"] == "HUMAN_REVIEW_REQUIRED"
+    assert result["artifact"]["sources"] == []
+    assert result["artifact"]["rejection_reason"] == (
+        "ONLY_EXHAUSTED_ORIGINAL_EVIDENCE"
+    )
+    assert llm.requests == []
+
+
+@pytest.mark.asyncio
 async def test_auto_discovery_prompt_includes_only_formal_meme_titles():
     repository = FormalMemeRepositoryStub()
     llm = FakeLLMProvider(responses=[{
@@ -1009,7 +1169,7 @@ def test_substantive_variant_filter(candidate, expected):
     ) is expected
 
 
-def test_substantive_variant_filter_rejects_unmapped_traditional_reprint():
+def test_substantive_variant_filter_rejects_traditional_reprint():
     assert real_registry.is_substantive_variant(
         "这个网络热门话题总是让人意想不到",
         "這個網絡熱門話題總是讓人意想不到",
@@ -1018,11 +1178,13 @@ def test_substantive_variant_filter_rejects_unmapped_traditional_reprint():
 
 
 @pytest.mark.parametrize(("candidate", "expected"), [
-    ("設計一個自動觸發彈窗", False),
-    ("帖子里写道，設計一個自動觸發彈窗，围观的人都笑了", False),
-    ("设计一个手动关闭agu窗口", True),
+    ("设计一个自动觸发弹窗", False),
+    ("设计一个自动触发彈窗", False),
+    ("帖子里写道，设计一个自动觸发弹窗，围观的人都笑了", False),
+    ("帖子里写道，设计一个自动触发彈窗，围观的人都笑了", False),
+    ("设计一个自动关闭弹窗", True),
 ])
-def test_substantive_variant_filter_rejects_near_glyph_reprints(
+def test_script_identity_distinguishes_traditional_glyphs_from_semantic_slots(
     candidate, expected,
 ):
     assert real_registry.is_substantive_variant(
@@ -1030,6 +1192,17 @@ def test_substantive_variant_filter_rejects_near_glyph_reprints(
         candidate,
         ["设计一个", "弹窗"],
     ) is expected
+
+
+def test_script_identity_is_shared_by_duplicate_similarity():
+    original = "设计一个自动触发弹窗"
+
+    assert real_registry._duplicate_similarity(
+        original, "设计一个自动觸发弹窗",
+    ) == 1.0
+    assert real_registry._duplicate_similarity(
+        original, "设计一个自动关闭弹窗",
+    ) < 1.0
 
 
 @pytest.mark.parametrize(("candidate", "expected"), [
@@ -1706,6 +1879,49 @@ async def test_n09_mixed_traditional_reprints_cannot_reach_sufficient():
 
 
 @pytest.mark.asyncio
+async def test_n09_uses_canonical_script_identity_for_variant_deduplication():
+    original = "设计一个自动触发弹窗"
+    variants = [
+        "设计一个手动触发agu弹窗",
+        "设计一个手动觸发agu弹窗",
+        "设计一个手动触发agu彈窗",
+    ]
+    sources = [
+        {
+            "source_id": f"V{i}",
+            "url": f"https://forum.example/{i}",
+            "title": f"网友改编{i}",
+            "text": variant,
+        }
+        for i, variant in enumerate(variants, 1)
+    ]
+    registry = build_real_registry(
+        llm=FakeLLMProvider(responses=[{"variants": [
+            {
+                "variant_text": variant,
+                "source_id": f"V{i}",
+                "source_url": f"https://forum.example/{i}",
+                "evidence_quote": variant,
+                "shared_anchor": "设计一个",
+            }
+            for i, variant in enumerate(variants, 1)
+        ]}]),
+        search=FakeSearchProvider(),
+    )
+
+    result = await registry.get("N09").execute({
+        "N05": {
+            "original_text": original,
+            "fixed_anchors": ["设计一个", "弹窗"],
+        },
+        "N08": {"sources": sources},
+    }, None)
+
+    assert result["outcome"] == "INSUFFICIENT"
+    assert result["artifact"]["llm"]["is_sufficient"] is False
+
+
+@pytest.mark.asyncio
 async def test_n09_rejects_title_body_split_evidence():
     original = "我猜中了开头，却猜不中这结局"
     variants = [
@@ -1895,6 +2111,47 @@ async def test_variant_retry_counter_uses_one_key_for_traditional_spellings():
     assert exhausted["outcome"] == "ABANDON_ORIGINAL"
     assert context.loop_counters == {
         "variant_search:万万没想到事情竟然会变成这样": 2,
+    }
+    assert context.exhausted_originals == [simplified]
+
+
+@pytest.mark.asyncio
+async def test_variant_retry_counter_uses_canonical_single_glyph_script_identity():
+    simplified = "设计一个自动触发弹窗"
+    traditional_trigger = "设计一个自动觸发弹窗"
+    traditional_window = "设计一个自动触发彈窗"
+    context = RunContext(
+        mode=RunMode.AUTO_DISCOVERY,
+        admission_mode=AdmissionMode.AUTO,
+        strategy_snapshot={"search": {}},
+    )
+    services = {"strategy_snapshot": context.strategy_snapshot}
+    registry = build_real_registry(llm=FailingLLM(), search=FakeSearchProvider())
+
+    first = await registry.get("N09").execute({
+        "N05": {"original_text": simplified, "fixed_anchors": ["设计一个"]},
+        "N08": {"sources": []},
+    }, services)
+    second = await registry.get("N09").execute({
+        "N05": {
+            "original_text": traditional_trigger,
+            "fixed_anchors": ["设计一个"],
+        },
+        "N08": {"sources": []},
+    }, services)
+    exhausted = await registry.get("N09").execute({
+        "N05": {
+            "original_text": traditional_window,
+            "fixed_anchors": ["设计一个"],
+        },
+        "N08": {"sources": []},
+    }, services)
+
+    assert first["artifact"]["fallback"]["count"] == 1
+    assert second["artifact"]["fallback"]["count"] == 2
+    assert exhausted["outcome"] == "ABANDON_ORIGINAL"
+    assert context.loop_counters == {
+        "variant_search:设计一个自动触发弹窗": 2,
     }
     assert context.exhausted_originals == [simplified]
 

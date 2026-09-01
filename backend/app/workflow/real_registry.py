@@ -7,7 +7,6 @@ The state machine still owns all routing decisions.
 from __future__ import annotations
 
 import re
-import unicodedata
 from difflib import SequenceMatcher
 from typing import Any
 
@@ -19,6 +18,7 @@ from ..providers.base import (
     SearchProvider,
     SearchRequest,
 )
+from .chinese_script import normalize_chinese_script
 from .registry import NodeRegistry
 
 _OUTCOMES = {
@@ -505,59 +505,6 @@ def _normalize_meme_text(text: str) -> str:
                   .replace("“", '"').replace("”", '"').rstrip("。！？!?"))
 
 
-_COMMON_TRADITIONAL_TO_SIMPLIFIED = str.maketrans({
-    "開": "开", "頭": "头", "卻": "却", "這": "这", "結": "结",
-    "網": "网", "絡": "络", "語": "语", "詞": "词", "義": "义",
-    "為": "为", "說": "说", "對": "对", "發": "发", "現": "现",
-    "實": "实", "體": "体", "來": "来", "時": "时", "個": "个",
-    "們": "们", "與": "与", "後": "后", "裡": "里", "從": "从",
-    "熱": "热", "門": "门", "話": "话", "題": "题", "總": "总",
-    "讓": "让", "覺": "觉", "興": "兴", "編": "编", "寫": "写",
-    "學": "学", "經": "经", "過": "过", "還": "还", "樣": "样",
-    "嗎": "吗", "無": "无", "關": "关", "點": "点", "應": "应",
-    "機": "机", "會": "会", "進": "进", "長": "长", "間": "间",
-    "問": "问", "頁": "页", "區": "区", "國": "国", "愛": "爱",
-    "傳": "传", "統": "统", "變": "变", "種": "种", "書": "书",
-    "圖": "图", "簡": "简", "轉": "转", "換": "换", "純": "纯",
-    "異": "异", "廣": "广", "東": "东", "臺": "台", "灣": "湾",
-    "萬": "万", "沒": "没", "風": "风", "雲": "云", "電": "电",
-    "車": "车", "馬": "马", "鳥": "鸟", "魚": "鱼", "龍": "龙",
-    "鳳": "凤", "貓": "猫", "劉": "刘", "張": "张", "楊": "杨",
-    "陳": "陈", "趙": "赵", "錢": "钱", "孫": "孙", "難": "难",
-    "歡": "欢", "歸": "归", "聽": "听", "見": "见", "給": "给",
-    "認": "认", "識": "识", "講": "讲", "請": "请", "謝": "谢",
-    "讀": "读", "買": "买", "賣": "卖", "著": "着", "麼": "么",
-    "於": "于", "將": "将", "當": "当", "麗": "丽", "嚴": "严",
-    "壞": "坏", "媽": "妈", "爺": "爷", "兒": "儿", "歲": "岁",
-    "號": "号", "遠": "远", "邊": "边", "選": "选", "擇": "择",
-    "啟": "启", "閉": "闭", "報": "报", "導": "导", "業": "业",
-    "產": "产", "線": "线", "級": "级", "數": "数", "據": "据",
-    "庫": "库", "測": "测", "試": "试", "驗": "验", "錯": "错",
-    "誤": "误", "斷": "断", "軟": "软", "項": "项", "標": "标",
-    "準": "准", "確": "确", "備": "备", "計": "计", "劃": "划",
-    "務": "务", "領": "领", "組": "组", "織": "织", "構": "构",
-    "運": "运", "維": "维", "護": "护", "該": "该", "夠": "够",
-    "處": "处", "輸": "输", "鍵": "键", "檔": "档", "檢": "检",
-    "查": "查", "複": "复", "製": "制", "刪": "删", "增": "增",
-    "減": "减", "險": "险", "權": "权", "限": "限", "態": "态",
-    "狀": "状", "敗": "败", "終": "终", "歷": "历", "記": "记",
-    "錄": "录", "資": "资", "訊": "讯", "註": "注", "冊": "册",
-    "登": "登", "陸": "陆", "戶": "户", "帳": "账",
-    "聯": "联", "繫": "系", "環": "环", "境": "境",
-    "設": "设", "置": "置", "顯": "显", "示": "示",
-    "隱": "隐", "藏": "藏", "優": "优", "先": "先", "隊": "队",
-    "列": "列", "協": "协", "議": "议", "響": "响", "載": "载",
-    "則": "则", "僅": "仅", "達": "达", "額": "额",
-    "滿": "满", "縮": "缩", "擴": "扩", "寬": "宽", "緊": "紧",
-    "鬆": "松", "細": "细", "節": "节", "內": "内",
-    "畫": "画", "顏": "颜", "聲": "声", "類": "类",
-    "別": "别", "輕": "轻", "重": "重", "強": "强", "弱": "弱",
-    "復": "复", "動": "动",
-    "暫": "暂", "停": "停", "繼": "继", "續": "续", "完": "完",
-    "畢": "毕", "順": "顺", "序": "序", "併": "并", "獨": "独",
-    "衝": "冲", "突": "突", "佔": "占", "屬": "属",
-    "獲": "获", "須": "须",
-})
 _VARIANT_WRAPPER = re.compile(
     r"(?:是什么意思|什么意思|意思是|含义|释义|赏析|解析|解读|出处|"
     r"原句(?:是|：|:)?|句子赏析|标题|台词|这句话|这句|网络流行(?:语|词)|"
@@ -567,8 +514,7 @@ _VARIANT_WRAPPER = re.compile(
 
 
 def _canonical_original_key(text: str) -> str:
-    normalized = unicodedata.normalize("NFKC", str(text))
-    normalized = normalized.translate(_COMMON_TRADITIONAL_TO_SIMPLIFIED)
+    normalized = normalize_chinese_script(text)
     normalized = _normalize_meme_text(normalized).casefold()
     return re.sub(r"[^0-9a-z\u4e00-\u9fff]", "", normalized)
 
@@ -577,33 +523,8 @@ def _normalize_variant_compare(text: str) -> str:
     return _canonical_original_key(text)
 
 
-def _is_near_glyph_reprint(original_key: str, candidate_key: str) -> bool:
-    """Detect conservative Han-only reprints missed by the finite glyph map."""
-    if len(original_key) < 6 or len(candidate_key) < len(original_key):
-        return False
-    if re.fullmatch(r"[\u4e00-\u9fff]+", original_key) is None:
-        return False
-    max_differences = max(1, min(3, len(original_key) // 5))
-    for start in range(len(candidate_key) - len(original_key) + 1):
-        window = candidate_key[start:start + len(original_key)]
-        if re.fullmatch(r"[\u4e00-\u9fff]+", window) is None:
-            continue
-        differences = sum(
-            left != right for left, right in zip(original_key, window, strict=True)
-        )
-        if (2 <= differences <= max_differences
-                and SequenceMatcher(None, original_key, window).ratio() >= 0.8):
-            return True
-    return False
-
-
 def _same_original_identity(left_key: str, right_key: str) -> bool:
-    if not left_key or not right_key:
-        return False
-    return left_key == right_key or (
-        len(left_key) == len(right_key)
-        and _is_near_glyph_reprint(left_key, right_key)
-    )
+    return bool(left_key) and left_key == right_key
 
 
 def _unique_identity_count(values: list[str]) -> int:
@@ -628,8 +549,6 @@ def is_substantive_variant(
     if (candidate_normalized == original_normalized
             or original_normalized in candidate_normalized
             or candidate_normalized in original_normalized):
-        return False
-    if _is_near_glyph_reprint(original_normalized, candidate_normalized):
         return False
     if len(candidate_normalized) > max(220, len(original_normalized) * 3):
         return False
@@ -830,16 +749,22 @@ def _is_exhausted_fragment(fragment: str, exhausted_keys: list[str]) -> bool:
     fragment_key = _canonical_original_key(fragment)
     return bool(fragment_key) and any(
         exhausted in fragment_key
-        or _is_near_glyph_reprint(exhausted, fragment_key)
         for exhausted in exhausted_keys
     )
 
 
+_EVIDENCE_ATTRIBUTION_BOUNDARY = re.compile(
+    r"(?<=[，,；;])(?=(?:网友|有人|楼主|作者|评论区)"
+    r"(?:还|又|也)?(?:说|写道|提到|回复|补充)[：:])",
+)
+
+
 def _evidence_fragments(text: str) -> list[str]:
     return [
-        fragment.strip()
+        clause.strip()
         for fragment in re.split(r"(?<=[。！？!?；;])|[\r\n]+", text)
-        if _canonical_original_key(fragment)
+        for clause in _EVIDENCE_ATTRIBUTION_BOUNDARY.split(fragment)
+        if _canonical_original_key(clause)
     ]
 
 
@@ -869,6 +794,7 @@ def _filter_exhausted_sources(
         has_candidate = bool(remaining_fragments) or (
             not title_exhausted
             and len(_canonical_original_key(remaining_title)) >= 6
+            and removed_fragment_count == 0
         )
         if not has_candidate:
             continue
