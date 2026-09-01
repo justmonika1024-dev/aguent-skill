@@ -2,11 +2,31 @@ import { Button, Space, Tag, Typography } from 'antd'
 import { useState } from 'react'
 
 export interface ArtifactNode {
+  execution_id?: string
+  id?: string
+  branch_id?: string
   node_key: string
+  attempt_no?: number
+  status?: string
+  input?: unknown
   output?: unknown
+  error_code?: string | null
+  error_message?: string | null
+  started_at?: string
+  ended_at?: string | null
+}
+
+export interface ArtifactBranch {
+  branch_id: string
+  parent_branch_id?: string | null
+  forked_from_execution_id?: string | null
 }
 
 type ArtifactRecord = Record<string, unknown>
+const INITIAL_EVIDENCE_LIMIT = 5
+const EXPANDED_EVIDENCE_LIMIT = 20
+const TITLE_LABEL_LIMIT = 80
+const URL_LABEL_LIMIT = 96
 
 function asRecord(value: unknown): ArtifactRecord | undefined {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -35,17 +55,125 @@ function excerpt(value: string, limit = 240): string {
   return compact.length > limit ? `${compact.slice(0, limit)}…` : compact
 }
 
-// This pure selector is colocated with the only component that consumes its artifact shape.
-// eslint-disable-next-line react-refresh/only-export-components
-export function latestNodeArtifact(nodes: readonly ArtifactNode[], nodeKey: string): ArtifactRecord | undefined {
-  const output = asRecord(nodes.filter((node) => node.node_key === nodeKey).at(-1)?.output)
+function truncatedLabel(value: string, limit: number): string {
+  return value.length > limit ? `${value.slice(0, limit)}…` : value
+}
+
+function isHttpUrl(value: string): boolean {
+  try {
+    const protocol = new URL(value).protocol
+    return protocol === 'http:' || protocol === 'https:'
+  } catch {
+    return false
+  }
+}
+
+function executionId(node: ArtifactNode): string {
+  return node.execution_id ?? node.id ?? ''
+}
+
+function executionTime(node: ArtifactNode): number | undefined {
+  const value = node.started_at ?? node.ended_at
+  if (!value) return undefined
+  const parsed = Date.parse(value)
+  return Number.isNaN(parsed) ? undefined : parsed
+}
+
+function compareExecutions(left: ArtifactNode, right: ArtifactNode): number {
+  const leftTime = executionTime(left)
+  const rightTime = executionTime(right)
+  if (leftTime !== undefined && rightTime !== undefined && leftTime !== rightTime) return leftTime - rightTime
+  if (left.node_key === right.node_key) {
+    const attemptDifference = (left.attempt_no ?? 0) - (right.attempt_no ?? 0)
+    if (attemptDifference) return attemptDifference
+  }
+  return executionId(left).localeCompare(executionId(right))
+}
+
+function unwrapArtifact(node: ArtifactNode | undefined): ArtifactRecord | undefined {
+  const output = asRecord(node?.output)
   return output ? asRecord(output.artifact) ?? output : undefined
 }
 
+function currentRoundExecution(nodes: readonly ArtifactNode[], nodeKey: string): ArtifactNode | undefined {
+  const ordered = [...nodes].sort(compareExecutions)
+  const hasCompleteOrdering = ordered.every((node) => executionTime(node) !== undefined)
+  const roundEnds = ordered.filter((node) => node.node_key === 'N17')
+  let candidates = ordered.filter((node) => node.node_key === nodeKey)
+
+  if (hasCompleteOrdering && roundEnds.length) {
+    const end = roundEnds.at(-1)!
+    const start = roundEnds.at(-2)
+    candidates = candidates.filter((node) => (
+      (!start || compareExecutions(node, start) > 0)
+      && compareExecutions(node, end) <= 0
+    ))
+  } else if (!hasCompleteOrdering && roundEnds.length) {
+    const roundAttempt = Math.max(...roundEnds.map((node) => node.attempt_no ?? 0))
+    candidates = candidates.filter((node) => (node.attempt_no ?? 0) >= roundAttempt)
+  }
+
+  return candidates.sort(compareExecutions).at(-1)
+}
+
+function ancestorExecutionBeforeFork(
+  nodes: readonly ArtifactNode[],
+  nodeKey: string,
+  branchId: string,
+  forkedFromExecutionId: string,
+): ArtifactNode | undefined {
+  const branchNodes = nodes.filter((node) => node.branch_id === branchId)
+  const cutoff = branchNodes.find((node) => executionId(node) === forkedFromExecutionId)
+  if (!cutoff || executionTime(cutoff) === undefined || branchNodes.some((node) => executionTime(node) === undefined)) return undefined
+
+  const ordered = [...branchNodes].sort(compareExecutions)
+  const previousRoundEnd = ordered
+    .filter((node) => node.node_key === 'N17' && compareExecutions(node, cutoff) < 0)
+    .at(-1)
+  return ordered.filter((node) => (
+    node.node_key === nodeKey
+    && (!previousRoundEnd || compareExecutions(node, previousRoundEnd) > 0)
+    && compareExecutions(node, cutoff) <= 0
+  )).at(-1)
+}
+
+// This pure selector is colocated with the only component that consumes its artifact shape.
+// eslint-disable-next-line react-refresh/only-export-components
+export function latestNodeArtifact(
+  nodes: readonly ArtifactNode[],
+  nodeKey: string,
+  activeBranchId: string,
+  branches: readonly ArtifactBranch[] = [],
+): ArtifactRecord | undefined {
+  const activeExecution = currentRoundExecution(
+    nodes.filter((node) => node.branch_id === activeBranchId),
+    nodeKey,
+  )
+  if (activeExecution) return unwrapArtifact(activeExecution)
+
+  const branchMap = new Map(branches.map((branch) => [branch.branch_id, branch]))
+  const visited = new Set<string>()
+  let child = branchMap.get(activeBranchId)
+  while (child?.parent_branch_id && child.forked_from_execution_id && !visited.has(child.branch_id)) {
+    visited.add(child.branch_id)
+    const inherited = ancestorExecutionBeforeFork(
+      nodes,
+      nodeKey,
+      child.parent_branch_id,
+      child.forked_from_execution_id,
+    )
+    if (inherited) return unwrapArtifact(inherited)
+    child = branchMap.get(child.parent_branch_id)
+  }
+  return undefined
+}
+
 function Link({ value }: { value?: string }) {
-  return value
-    ? <Typography.Link href={value} target="_blank" rel="noreferrer">{value}</Typography.Link>
-    : null
+  if (!value) return null
+  const label = truncatedLabel(value, URL_LABEL_LIMIT)
+  return isHttpUrl(value)
+    ? <Typography.Link href={value} target="_blank" rel="noreferrer">{label}</Typography.Link>
+    : <Typography.Text>{label}</Typography.Text>
 }
 
 function QuerySummary({ artifact }: { artifact: ArtifactRecord }) {
@@ -57,19 +185,23 @@ function QuerySummary({ artifact }: { artifact: ArtifactRecord }) {
 
 function SearchEvidenceSummary({ artifact }: { artifact: ArtifactRecord }) {
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set())
+  const [showMore, setShowMore] = useState(false)
   const material = payload(artifact)
-  const sources = records(material.sources).length ? records(material.sources) : records(material.results)
+  const sourceRecords = records(material.sources)
+  const sources = sourceRecords.length ? sourceRecords : records(material.results)
 
   if (!sources.length) return <Typography.Text type="secondary">未解析到搜索证据。</Typography.Text>
 
-  return <div className="artifact-evidence-list">{sources.map((source, index) => {
+  const visibleLimit = showMore ? EXPANDED_EVIDENCE_LIMIT : INITIAL_EVIDENCE_LIMIT
+  const visibleSources = sources.slice(0, visibleLimit)
+  return <div className="artifact-evidence-list">{visibleSources.map((source, index) => {
     const key = stringValue(source.source_id) ?? stringValue(source.url) ?? String(index)
     const title = stringValue(source.title) ?? `证据 ${index + 1}`
     const url = stringValue(source.url) ?? stringValue(source.canonical_url)
     const sourceText = stringValue(source.text)
     const isExpanded = expanded.has(key)
     return <div className="artifact-evidence-item" key={key}>
-      <Typography.Text strong>{title}</Typography.Text>
+      <Typography.Text strong>{truncatedLabel(title, TITLE_LABEL_LIMIT)}</Typography.Text>
       {url && <div><Link value={url} /></div>}
       {sourceText && <Button
         type="link"
@@ -83,7 +215,14 @@ function SearchEvidenceSummary({ artifact }: { artifact: ArtifactRecord }) {
       >{isExpanded ? '收起证据' : '展开证据'}</Button>}
       {isExpanded && sourceText && <Typography.Paragraph>{excerpt(sourceText)}</Typography.Paragraph>}
     </div>
-  })}</div>
+  })}
+    {sources.length > INITIAL_EVIDENCE_LIMIT && <Button type="link" onClick={() => setShowMore((value) => !value)}>
+      {showMore ? '收起其余证据' : '展开其余证据'}
+    </Button>}
+    {showMore && sources.length > EXPANDED_EVIDENCE_LIMIT && <Typography.Text type="secondary">
+      仅显示前 {EXPANDED_EVIDENCE_LIMIT} 条，共 {sources.length} 条
+    </Typography.Text>}
+  </div>
 }
 
 function SelectedOriginalSummary({ artifact }: { artifact: ArtifactRecord }) {
@@ -204,9 +343,19 @@ function NodeSummary({ nodeKey, artifact }: { nodeKey: string; artifact: Artifac
   }
 }
 
-export function RunArtifactSummary({ nodes, nodeKeys }: { nodes: readonly ArtifactNode[]; nodeKeys: readonly string[] }) {
+export function RunArtifactSummary({
+  nodes,
+  nodeKeys,
+  activeBranchId,
+  branches = [],
+}: {
+  nodes: readonly ArtifactNode[]
+  nodeKeys: readonly string[]
+  activeBranchId: string
+  branches?: readonly ArtifactBranch[]
+}) {
   return <div className="run-artifact-summary">{nodeKeys.map((nodeKey) => {
-    const artifact = latestNodeArtifact(nodes, nodeKey)
+    const artifact = latestNodeArtifact(nodes, nodeKey, activeBranchId, branches)
     return <section className="run-artifact-node" data-node-key={nodeKey} key={nodeKey}>
       <Typography.Title level={5}>{nodeKey}</Typography.Title>
       {artifact
