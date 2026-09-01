@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
@@ -61,6 +60,50 @@ _MODULAR_EVALUATION_KEYS = (
     "variant_search_results",
     "template_extraction",
 )
+_EVALUATION_FEEDBACK_KEY = "_evaluation_feedback"
+_EVALUATION_FEEDBACK_SCHEMA_VERSION = 1
+
+
+def _automatic_admission_decision(context: Any) -> str | None:
+    for artifacts in (context.active_artifacts, context.node_outputs):
+        value = artifacts.get("N17", {})
+        if isinstance(value, dict) and isinstance(value.get("llm"), dict):
+            value = value["llm"]
+        if isinstance(value, dict):
+            decision = value.get("admission_decision") or value.get("decision")
+            if decision in {"ADMIT", "NOT_ADMIT"}:
+                return str(decision)
+    return None
+
+
+def _resolve_admission(context: Any, admission: dict[str, Any]) -> str:
+    decision = admission.get("decision")
+    override = admission.get("override")
+    if context.admission_mode is AdmissionMode.HUMAN:
+        if decision not in {"ADMIT", "NOT_ADMIT"} or override is not None:
+            raise HTTPException(422, detail={
+                "code": "INVALID_ADMISSION",
+                "message": "HUMAN admission requires decision and forbids override",
+            })
+        return str(decision)
+    if decision is not None or override not in {
+        "KEEP", "OVERRIDE_TO_ADMIT", "OVERRIDE_TO_NOT_ADMIT",
+    }:
+        raise HTTPException(422, detail={
+            "code": "INVALID_ADMISSION",
+            "message": "AUTO admission requires override and forbids decision",
+        })
+    if override == "OVERRIDE_TO_ADMIT":
+        return "ADMIT"
+    if override == "OVERRIDE_TO_NOT_ADMIT":
+        return "NOT_ADMIT"
+    automatic_decision = _automatic_admission_decision(context)
+    if automatic_decision is None:
+        raise HTTPException(422, detail={
+            "code": "INVALID_ADMISSION",
+            "message": "AUTO KEEP requires an N17 admission decision",
+        })
+    return automatic_decision
 
 
 def _evaluation_record(row: Any) -> dict[str, Any]:
@@ -72,6 +115,10 @@ def _evaluation_record(row: Any) -> dict[str, Any]:
         "admission_decision": row.admission_decision,
     }
     if all(key in processing_chain for key in _MODULAR_EVALUATION_KEYS):
+        feedback = processing_chain.get(_EVALUATION_FEEDBACK_KEY, {})
+        if not (isinstance(feedback, dict)
+                and feedback.get("schema_version") == _EVALUATION_FEEDBACK_SCHEMA_VERSION):
+            feedback = {}
         return {
             **common,
             **{key: processing_chain[key] for key in _MODULAR_EVALUATION_KEYS},
@@ -79,6 +126,12 @@ def _evaluation_record(row: Any) -> dict[str, Any]:
                 "overall": row.candidate_set_scores_json,
                 "candidates": row.candidate_scores_json,
             },
+            "admission": feedback.get("admission", {
+                "decision": row.admission_decision,
+                "override": None,
+                "reason": "",
+            }),
+            "overall_comment": feedback.get("overall_comment", ""),
         }
     return {
         **common,
@@ -333,12 +386,16 @@ async def submit_evaluation(run_id: str, body: HumanEvaluationRequest) -> dict[s
     branch = payload.pop("branch_id")
     if branch != c.active_branch_id or expected != c.run_version:
         raise HTTPException(409, detail={"code": "RUN_VERSION_CONFLICT"})
-    return await _engine.submit_evaluation(
-        run_id,
-        payload,
-        expected_run_version=expected,
-        branch_id=branch,
-    )
+    payload["admission_decision"] = _resolve_admission(c, payload["admission"])
+    try:
+        return await _engine.submit_evaluation(
+            run_id,
+            payload,
+            expected_run_version=expected,
+            branch_id=branch,
+        )
+    except WorkflowConflict as exc:
+        raise HTTPException(409, detail={"code": str(exc)})
 
 
 @router.get("/runs/{run_id}/evaluation-form")
@@ -528,26 +585,10 @@ async def get_strategy(strategy_id: str) -> dict[str, Any]:
 
 @router.post("/strategies/{strategy_id}/activate")
 async def activate_strategy(strategy_id: str) -> dict[str, Any]:
-    if _engine.active is not None:
-        raise HTTPException(409, detail={"code": "ACTIVE_RUN_EXISTS"})
-    repository = getattr(_engine, "repository", None)
-    if repository is None:
+    try:
+        await _engine.activate_strategy(strategy_id)
+    except WorkflowConflict as exc:
+        raise HTTPException(409, detail={"code": str(exc)})
+    except KeyError:
         raise HTTPException(404, detail={"code": "STRATEGY_NOT_FOUND"})
-    await repository.init()
-    from ..db.models import RunStrategyState, RunStrategyVersion
-    async with repository.session() as session, session.begin():
-        version = await session.get(RunStrategyVersion, strategy_id)
-        if version is None:
-            raise HTTPException(404, detail={"code": "STRATEGY_NOT_FOUND"})
-        state = await session.get(RunStrategyState, 1)
-        if state is None:
-            state = RunStrategyState(
-                id=1,
-                active_strategy_version_id=strategy_id,
-                updated_at=datetime.now(UTC),
-            )
-            session.add(state)
-        else:
-            state.active_strategy_version_id = strategy_id
-            state.updated_at = datetime.now(UTC)
     return {"strategy_id": strategy_id, "is_active": True}

@@ -72,6 +72,14 @@ class WorkflowEngine:
         async with self._lock:
             return await self._command_locked(run_id, command)
 
+    async def activate_strategy(self, strategy_id: str) -> str:
+        async with self._lock:
+            if self.active is not None:
+                raise WorkflowConflict("ACTIVE_RUN_EXISTS")
+            if self.repository is None:
+                raise KeyError(strategy_id)
+            return await self.repository.activate_strategy(strategy_id)
+
     async def _command_locked(self, run_id: str, command: Command) -> Any:
         context = self.contexts.get(run_id)
         if context is None:

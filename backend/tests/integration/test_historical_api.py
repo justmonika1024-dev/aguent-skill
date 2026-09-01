@@ -10,8 +10,9 @@ from sqlalchemy import select
 from app.db.models import RunHumanEvaluation, RunStrategyPatch
 from app.db.persistence import SQLiteRepository
 from app.main import app
-from app.workflow.context import AdmissionMode, RunContext, RunMode
+from app.workflow.context import AdmissionMode, RunContext, RunMode, RunState
 from app.workflow.engine import WorkflowEngine
+from app.workflow.events import EventBus
 
 
 def modular_evaluation_payload(expected_run_version: int, branch_id: str) -> dict:
@@ -164,11 +165,14 @@ async def test_modular_evaluation_api_validates_persists_and_reuses_evaluation_i
         })
         assert legacy_submission.status_code == 422
 
+        payload = modular_evaluation_payload(
+            snapshot["run_version"], snapshot["active_branch_id"],
+        )
+        payload["admission"]["reason"] = "人工确认质量达标"
+        payload["overall_comment"] = "七模块整体可用"
         submitted = await client.post(
             f"/api/v1/runs/{run_id}/evaluation",
-            json=modular_evaluation_payload(
-                snapshot["run_version"], snapshot["active_branch_id"],
-            ),
+            json=payload,
         )
         assert submitted.status_code == 200
 
@@ -186,5 +190,115 @@ async def test_modular_evaluation_api_validates_persists_and_reuses_evaluation_i
     assert evaluation["original_search_plan"]["anchor_accuracy"] == 4
     assert evaluation["variant_search_results"]["comment"] == ""
     assert evaluation["candidate_generation"]["candidates"]["C5"]["usability"] == "USABLE"
+    assert evaluation["admission"] == {
+        "decision": "ADMIT",
+        "override": None,
+        "reason": "人工确认质量达标",
+    }
+    assert evaluation["overall_comment"] == "七模块整体可用"
     assert patch is not None
     assert patch.evaluation_id == evaluation["evaluation_id"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("admission_mode", "admission"), [
+    (AdmissionMode.HUMAN, {}),
+    (AdmissionMode.HUMAN, {"override": "KEEP"}),
+    (AdmissionMode.HUMAN, {"decision": "ADMIT", "override": "KEEP"}),
+    (AdmissionMode.AUTO, {}),
+    (AdmissionMode.AUTO, {"decision": "ADMIT"}),
+    (AdmissionMode.AUTO, {"decision": "ADMIT", "override": "KEEP"}),
+])
+async def test_modular_evaluation_rejects_admission_fields_for_wrong_mode(
+    admission_mode, admission, monkeypatch,
+):
+    context = RunContext(mode=RunMode.AUTO_DISCOVERY, admission_mode=admission_mode)
+    context.current_state = RunState.WAITING_HUMAN_EVALUATION
+    engine = WorkflowEngine()
+    engine.contexts[context.run_id] = context
+    engine.buses[context.run_id] = EventBus()
+    api_router = importlib.import_module("app.api.router")
+    monkeypatch.setattr(api_router, "_engine", engine)
+    payload = modular_evaluation_payload(context.run_version, context.active_branch_id)
+    payload["admission"] = admission
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(f"/api/v1/runs/{context.run_id}/evaluation", json=payload)
+
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("override", "automatic_decision", "expected_decision"), [
+    ("KEEP", "ADMIT", "ADMIT"),
+    ("OVERRIDE_TO_ADMIT", "NOT_ADMIT", "ADMIT"),
+    ("OVERRIDE_TO_NOT_ADMIT", "ADMIT", "NOT_ADMIT"),
+])
+async def test_modular_evaluation_auto_override_persists_resolved_decision_and_feedback(
+    override, automatic_decision, expected_decision, tmp_path, monkeypatch,
+):
+    repository = SQLiteRepository(
+        f"sqlite+aiosqlite:///{tmp_path / f'auto-{override}.db'}",
+    )
+    engine = WorkflowEngine(repository=repository)
+    api_router = importlib.import_module("app.api.router")
+    monkeypatch.setattr(api_router, "_engine", engine)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        created = await client.post("/api/v1/runs", json={
+            "mode": "AUTO_DISCOVERY",
+            "admission_mode": "AUTO",
+        })
+        run_id = created.json()["run_id"]
+        for _ in range(400):
+            snapshot = (await client.get(f"/api/v1/runs/{run_id}")).json()
+            if snapshot["state"] == "WAITING_HUMAN_EVALUATION":
+                break
+            await asyncio.sleep(0.005)
+        assert snapshot["state"] == "WAITING_HUMAN_EVALUATION"
+        n17 = {"decision": automatic_decision}
+        engine.contexts[run_id].node_outputs["N17"] = n17
+        engine.contexts[run_id].active_artifacts["N17"] = n17
+        payload = modular_evaluation_payload(
+            snapshot["run_version"], snapshot["active_branch_id"],
+        )
+        payload["admission"] = {"override": override, "reason": "自动结论复核"}
+        payload["overall_comment"] = "AUTO 模式完整反馈"
+
+        submitted = await client.post(f"/api/v1/runs/{run_id}/evaluation", json=payload)
+        assert submitted.status_code == 200
+        for _ in range(400):
+            record = (await client.get(f"/api/v1/runs/{run_id}/record")).json()
+            if (record["evaluations"]
+                    and record["run"]["admission_decision"] == expected_decision):
+                break
+            await asyncio.sleep(0.005)
+
+    evaluation = record["evaluations"][0]
+    assert evaluation["admission"] == {
+        "decision": None,
+        "override": override,
+        "reason": "自动结论复核",
+    }
+    assert evaluation["admission_decision"] == expected_decision
+    assert evaluation["overall_comment"] == "AUTO 模式完整反馈"
+    assert record["run"]["admission_decision"] == expected_decision
+
+
+@pytest.mark.asyncio
+async def test_modular_evaluation_maps_engine_workflow_conflict_to_http_409(monkeypatch):
+    context = RunContext(mode=RunMode.MANUAL_SEED, admission_mode=AdmissionMode.HUMAN)
+    context.current_state = RunState.RUNNING
+    engine = WorkflowEngine()
+    engine.contexts[context.run_id] = context
+    api_router = importlib.import_module("app.api.router")
+    monkeypatch.setattr(api_router, "_engine", engine)
+    payload = modular_evaluation_payload(context.run_version, context.active_branch_id)
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://test",
+    ) as client:
+        response = await client.post(f"/api/v1/runs/{context.run_id}/evaluation", json=payload)
+
+    assert response.status_code == 409

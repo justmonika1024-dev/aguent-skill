@@ -35,6 +35,8 @@ _MODULAR_EVALUATION_KEYS = (
     "variant_search_results",
     "template_extraction",
 )
+_EVALUATION_FEEDBACK_KEY = "_evaluation_feedback"
+_EVALUATION_FEEDBACK_SCHEMA_VERSION = 1
 
 
 def _json(value: Any) -> Any:
@@ -156,6 +158,25 @@ class SQLiteRepository:
             state.active_strategy_version_id = after_version_id
             state.updated_at = now
             return after_version_id, after
+
+    async def activate_strategy(self, strategy_id: str) -> str:
+        await self.init()
+        async with self.session() as s, s.begin():
+            version = await s.get(RunStrategyVersion, strategy_id)
+            if version is None:
+                raise KeyError(strategy_id)
+            state = await s.get(RunStrategyState, 1)
+            now = datetime.now(UTC)
+            if state is None:
+                s.add(RunStrategyState(
+                    id=1,
+                    active_strategy_version_id=strategy_id,
+                    updated_at=now,
+                ))
+            else:
+                state.active_strategy_version_id = strategy_id
+                state.updated_at = now
+        return strategy_id
 
     async def sync_run_snapshot(self, context: Any) -> None:
         await self.init()
@@ -338,12 +359,29 @@ class SQLiteRepository:
 
     async def persist_evaluation(self, context: Any, payload: dict[str, Any]) -> None:
         async with self.session() as s:
-            decision = payload.get("admission_decision") or payload.get("admission", {}).get("decision")
+            admission = payload.get("admission", {})
+            override_decisions = {
+                "OVERRIDE_TO_ADMIT": "ADMIT",
+                "OVERRIDE_TO_NOT_ADMIT": "NOT_ADMIT",
+            }
+            decision = (
+                payload.get("admission_decision")
+                or admission.get("decision")
+                or override_decisions.get(admission.get("override"))
+            )
             processing_chain = {
                 key: _json(payload[key])
                 for key in _MODULAR_EVALUATION_KEYS
                 if key in payload
             }
+            if all(key in processing_chain for key in _MODULAR_EVALUATION_KEYS):
+                if decision is None:
+                    raise ValueError("modular evaluation requires a resolved admission decision")
+                processing_chain[_EVALUATION_FEEDBACK_KEY] = {
+                    "schema_version": _EVALUATION_FEEDBACK_SCHEMA_VERSION,
+                    "admission": _json(admission),
+                    "overall_comment": str(payload.get("overall_comment", "")),
+                }
             candidate_generation = payload.get("candidate_generation", {})
             s.add(RunHumanEvaluation(
                 id=str(payload.get("evaluation_id") or uuid4().hex),

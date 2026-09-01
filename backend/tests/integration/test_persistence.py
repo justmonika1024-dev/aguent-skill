@@ -1,6 +1,5 @@
 import asyncio
 import importlib
-from types import SimpleNamespace
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -43,6 +42,28 @@ class FailOnceNode(FakeNode):
         if self.calls == 1:
             raise ValueError("N12 must treat agu as the person receiving the action 凿")
         return await super().execute(value, services)
+
+
+class BlockingActivationRepository(SQLiteRepository):
+    def __init__(self, database_url):
+        super().__init__(database_url)
+        self.block_activation = False
+        self.activation_entered = asyncio.Event()
+        self.release_activation = asyncio.Event()
+        self.track_start = False
+        self.start_entered_strategy_read = asyncio.Event()
+
+    async def init(self):
+        if self.block_activation:
+            self.block_activation = False
+            self.activation_entered.set()
+            await self.release_activation.wait()
+        await super().init()
+
+    async def ensure_active_strategy(self):
+        if self.track_start:
+            self.start_entered_strategy_read.set()
+        return await super().ensure_active_strategy()
 
 
 def test_strategy_defaults_are_isolated_and_patches_are_validated():
@@ -151,11 +172,8 @@ async def test_strategy_api_lists_versions_returns_patch_audit_and_activates_ver
         },
     )
     api_router = importlib.import_module("app.api.router")
-    monkeypatch.setattr(
-        api_router,
-        "_engine",
-        SimpleNamespace(repository=repo, contexts={}, active=None),
-    )
+    engine = WorkflowEngine(repository=repo)
+    monkeypatch.setattr(api_router, "_engine", engine)
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         response = await client.get("/api/v1/strategies")
@@ -177,7 +195,12 @@ async def test_strategy_api_lists_versions_returns_patch_audit_and_activates_ver
         assert activated.status_code == 200
         assert activated.json() == {"strategy_id": first_id, "is_active": True}
 
-        monkeypatch.setattr(api_router._engine, "active", object())
+        active_context = RunContext(
+            mode=RunMode.AUTO_DISCOVERY,
+            admission_mode=AdmissionMode.AUTO,
+        )
+        active_context.current_state = RunState.RUNNING
+        engine.contexts[active_context.run_id] = active_context
         conflict = await client.post(f"/api/v1/strategies/{second_id}/activate")
         assert conflict.status_code == 409
         missing = await client.get("/api/v1/strategies/missing")
@@ -186,6 +209,46 @@ async def test_strategy_api_lists_versions_returns_patch_audit_and_activates_ver
     async with repo.session() as session:
         state = await session.get(RunStrategyState, 1)
     assert state.active_strategy_version_id == first_id
+
+
+@pytest.mark.asyncio
+async def test_strategy_activation_lock_prevents_start_after_active_check_from_penetrating(
+    tmp_path, monkeypatch,
+):
+    repo = BlockingActivationRepository(
+        f"sqlite+aiosqlite:///{tmp_path / 'strategy-activation-race.db'}",
+    )
+    first_id, _ = await repo.ensure_active_strategy()
+    second_id, _ = await repo.apply_strategy_patch(
+        source_run_id="run-1",
+        evaluation_id="eval-1",
+        before_version_id=first_id,
+        patch={"patch_operations": []},
+    )
+    engine = WorkflowEngine(repository=repo)
+    api_router = importlib.import_module("app.api.router")
+    monkeypatch.setattr(api_router, "_engine", engine)
+    repo.block_activation = True
+    repo.track_start = True
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        activation_task = asyncio.create_task(
+            client.post(f"/api/v1/strategies/{first_id}/activate"),
+        )
+        await repo.activation_entered.wait()
+        start_task = asyncio.create_task(engine.start_run(
+            mode=RunMode.AUTO_DISCOVERY,
+            admission_mode=AdmissionMode.AUTO,
+        ))
+        await asyncio.sleep(0)
+        start_penetrated = repo.start_entered_strategy_read.is_set()
+        repo.release_activation.set()
+        activation_response, context = await asyncio.gather(activation_task, start_task)
+
+    assert not start_penetrated
+    assert activation_response.status_code == 200
+    assert context.strategy_version_id == first_id
+    assert context.strategy_version_id != second_id
 
 
 @pytest.mark.asyncio
