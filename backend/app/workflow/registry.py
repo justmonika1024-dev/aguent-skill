@@ -21,7 +21,7 @@ class NodeRegistry:
         with an explicit mapping; the defaults keep the API usable before keys
         are configured and provide a predictable development smoke path.
         """
-        from .nodes.nodes import Node
+        from .nodes.nodes import N17, Node
 
         outcomes = {
             "N01": "ACCEPTED", "N02": "PLANNED", "N03": "PLAN_READY",
@@ -33,7 +33,11 @@ class NodeRegistry:
             "N19": "PATCH_VALID", "N20": "COMPLETED",
         }
         for key, outcome in outcomes.items():
-            self._nodes[key] = Node(key=key, default_outcome=outcome)  # type: ignore[assignment]
+            self._nodes[key] = (
+                N17(default_outcome=outcome)
+                if key == "N17"
+                else Node(key=key, default_outcome=outcome)
+            )  # type: ignore[assignment]
 
     def register(self, node: WorkflowNode) -> None:
         key = getattr(node, "key", getattr(node, "node_key", None))

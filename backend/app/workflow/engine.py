@@ -218,6 +218,7 @@ class WorkflowEngine:
                             "run_id": context.run_id,
                             "repository": self.repository,
                             "services": self.services,
+                            "admission_mode": context.admission_mode.value,
                             "strategy_version_id": context.strategy_version_id,
                             "strategy_snapshot": context.strategy_snapshot,
                         }

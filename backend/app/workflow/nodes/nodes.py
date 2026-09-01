@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ...providers.base import NodeLLMRequest, SearchRequest
+from ...services.admission import AdmissionService
 from .contracts import (
     N03SearchPlan,
     N09EvidenceEvaluation,
@@ -96,7 +97,25 @@ class N15(ProviderNode):
             if selected is not None and final != selected: raise ValueError("N15 final_agu_text must equal selected candidate")
         return result
 class N16(Node): node_key = "N16"
-class N17(Node): node_key = "N17"
+class N17(Node):
+    node_key = "N17"
+
+    async def execute(self, value: Any, services: Any = None) -> NodeResult:
+        mode = services.get("admission_mode", "HUMAN") if isinstance(services, dict) else "HUMAN"
+        source = value.get("N16", {}) if isinstance(value, dict) else {}
+        if isinstance(source, dict) and isinstance(source.get("llm"), dict):
+            source = source["llm"]
+        decision = AdmissionService().decide(source, mode=str(mode))
+        artifact = {
+            "reason": decision.reason,
+            "safety": decision.safety,
+        }
+        if str(mode) == "AUTO":
+            artifact["admission_decision"] = decision.decision
+            outcome = "AUTO_DECIDED"
+        else:
+            outcome = "WAIT_HUMAN_DECISION"
+        return NodeResult(self.node_key, outcome, artifact)
 class N18(Node): node_key = "N18"
 class N19(ProviderNode): node_key = "N19"
 class N20(Node): node_key = "N20"

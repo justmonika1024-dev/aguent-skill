@@ -14,8 +14,11 @@ def test_default_engine_registers_all_nodes_and_reaches_human_gate():
         )
         for _ in range(200):
             if ctx.current_state is RunState.WAITING_HUMAN_EVALUATION:
-                return True
+                return ctx
             await asyncio.sleep(0.001)
-        return False
+        return ctx
 
-    assert asyncio.run(run())
+    context = asyncio.run(run())
+
+    assert context.current_state is RunState.WAITING_HUMAN_EVALUATION
+    assert "admission_decision" not in context.node_outputs["N17"]

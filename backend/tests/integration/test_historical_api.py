@@ -13,6 +13,20 @@ from app.main import app
 from app.workflow.context import AdmissionMode, RunContext, RunMode, RunState
 from app.workflow.engine import WorkflowEngine
 from app.workflow.events import EventBus
+from app.workflow.registry import NodeRegistry
+
+
+class AdmissionInputN16:
+    key = "N16"
+
+    def __init__(self, automatic_decision: str) -> None:
+        self.score = 4 if automatic_decision == "ADMIT" else 3
+
+    async def execute(self, node_input, services):
+        return {
+            "outcome": "NOT_DUPLICATE",
+            "artifact": {"score": self.score, "threshold": 3.5, "safety": "PASS"},
+        }
 
 
 def modular_evaluation_payload(expected_run_version: int, branch_id: str) -> dict:
@@ -240,7 +254,9 @@ async def test_modular_evaluation_auto_override_persists_resolved_decision_and_f
     repository = SQLiteRepository(
         f"sqlite+aiosqlite:///{tmp_path / f'auto-{override}.db'}",
     )
-    engine = WorkflowEngine(repository=repository)
+    registry = NodeRegistry()
+    registry.register(AdmissionInputN16(automatic_decision))
+    engine = WorkflowEngine(registry=registry, repository=repository)
     api_router = importlib.import_module("app.api.router")
     monkeypatch.setattr(api_router, "_engine", engine)
 
@@ -256,9 +272,11 @@ async def test_modular_evaluation_auto_override_persists_resolved_decision_and_f
                 break
             await asyncio.sleep(0.005)
         assert snapshot["state"] == "WAITING_HUMAN_EVALUATION"
-        n17 = {"decision": automatic_decision}
-        engine.contexts[run_id].node_outputs["N17"] = n17
-        engine.contexts[run_id].active_artifacts["N17"] = n17
+        assert engine.contexts[run_id].node_outputs["N17"] == {
+            "admission_decision": automatic_decision,
+            "reason": "",
+            "safety": "PASS",
+        }
         payload = modular_evaluation_payload(
             snapshot["run_version"], snapshot["active_branch_id"],
         )
@@ -283,6 +301,10 @@ async def test_modular_evaluation_auto_override_persists_resolved_decision_and_f
     assert evaluation["admission_decision"] == expected_decision
     assert evaluation["overall_comment"] == "AUTO 模式完整反馈"
     assert record["run"]["admission_decision"] == expected_decision
+    persisted_n17 = next(
+        node for node in record["nodes"] if node["node_key"] == "N17"
+    )
+    assert persisted_n17["output"]["admission_decision"] == automatic_decision
 
 
 @pytest.mark.asyncio

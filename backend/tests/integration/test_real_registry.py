@@ -51,6 +51,23 @@ class UsageRepositoryStub:
         self.api_calls.append({"args": args, "kwargs": kwargs})
 
 
+@pytest.mark.asyncio
+async def test_real_registry_n17_produces_auto_admission_decision():
+    registry = build_real_registry(llm=FakeLLMProvider(), search=FakeSearchProvider())
+
+    result = await registry.get("N17").execute(
+        {"N16": {"score": 4, "threshold": 3.5, "safety": "PASS"}},
+        {"admission_mode": "AUTO"},
+    )
+
+    assert result.outcome == "AUTO_DECIDED"
+    assert result.output == {
+        "admission_decision": "ADMIT",
+        "reason": "",
+        "safety": "PASS",
+    }
+
+
 def test_low_variant_scores_force_search_quality_patch():
     evaluation = {
         "variant_search_plan": {

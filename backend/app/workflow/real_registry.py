@@ -19,6 +19,7 @@ from ..providers.base import (
     SearchRequest,
 )
 from .chinese_script import normalize_chinese_script
+from .nodes.nodes import N17
 from .registry import NodeRegistry
 
 _OUTCOMES = {
@@ -2230,5 +2231,7 @@ def context_run_id(value: Any) -> str:
 
 
 def build_real_registry(*, llm: LLMProvider, search: SearchProvider, repository: Any = None) -> NodeRegistry:
-    return NodeRegistry({key: RealWorkflowNode(key, outcome, llm, search, repository)
-                         for key, outcome in _OUTCOMES.items()})
+    nodes = {key: RealWorkflowNode(key, outcome, llm, search, repository)
+             for key, outcome in _OUTCOMES.items()}
+    nodes["N17"] = N17(default_outcome=_OUTCOMES["N17"])
+    return NodeRegistry(nodes)
