@@ -51,21 +51,79 @@ class UsageRepositoryStub:
         self.api_calls.append({"args": args, "kwargs": kwargs})
 
 
+def automatic_admission_artifacts(
+    *, template_accuracy: int = 5, safety: str = "PASS",
+) -> dict:
+    selected_score = {
+        "candidate_id": "C1",
+        "fluency": 5,
+        "recognition": 5,
+        "agu_fit": 5,
+        "humor": 4,
+        "rhythm": 4,
+        "adaptation_restraint": 5,
+        "qualified": True,
+        "action_affirmed": True,
+        "critical_failures": [],
+    }
+    return {
+        "N09": {"llm": {"is_sufficient": True, "variants": [{}, {}, {}]}},
+        "N11": {"llm": {
+            "decision": "PASS", "accuracy": template_accuracy, "coverage": 0.9,
+        }},
+        "N11.5": {"llm": {"route": "STRUCTURE_PRESERVING_REWRITE"}},
+        "N13": {"llm": {
+            "scores": [selected_score], "qualified_candidate_ids": ["C1"],
+        }},
+        "N14": {"llm": {"selected_candidate_id": "C1"}},
+        "N15": {"llm": {
+            "final_agu_text": "他正在凿agu。", "content_safety": safety,
+        }},
+    }
+
+
 @pytest.mark.asyncio
-async def test_real_registry_n17_produces_auto_admission_decision():
+async def test_real_registry_n16_and_n17_admit_high_quality_artifacts():
     registry = build_real_registry(llm=FakeLLMProvider(), search=FakeSearchProvider())
 
-    result = await registry.get("N17").execute(
-        {"N16": {"score": 4, "threshold": 3.5, "safety": "PASS"}},
-        {"admission_mode": "AUTO"},
+    n16 = await registry.get("N16").execute(automatic_admission_artifacts(), None)
+    n17 = await registry.get("N17").execute(
+        {"N16": n16["artifact"]}, {"admission_mode": "AUTO"},
     )
 
-    assert result.outcome == "AUTO_DECIDED"
-    assert result.output == {
-        "admission_decision": "ADMIT",
-        "reason": "",
-        "safety": "PASS",
-    }
+    assert n16["outcome"] == "NOT_DUPLICATE"
+    assert n16["artifact"]["score"] == pytest.approx(14 / 3)
+    assert n16["artifact"]["threshold"] == 4.0
+    assert n16["artifact"]["failed_conditions"] == []
+    assert "模板准确度5/5" in n16["artifact"]["decision_basis"]
+    assert "六维均分4.67" in n16["artifact"]["decision_basis"]
+    assert n17.outcome == "AUTO_DECIDED"
+    assert n17.output["admission_decision"] == "ADMIT"
+    assert n17.output["reason"] == n16["artifact"]["decision_basis"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("artifacts", "failed_condition", "safety"), [
+    (automatic_admission_artifacts(template_accuracy=3), "N11_ACCURACY_BELOW_4", "PASS"),
+    (automatic_admission_artifacts(safety="REJECT"), None, "REJECT"),
+])
+async def test_real_registry_n16_and_n17_reject_low_quality_or_unsafe_artifacts(
+    artifacts, failed_condition, safety,
+):
+    registry = build_real_registry(llm=FakeLLMProvider(), search=FakeSearchProvider())
+
+    n16 = await registry.get("N16").execute(artifacts, None)
+    n17 = await registry.get("N17").execute(
+        {"N16": n16["artifact"]}, {"admission_mode": "AUTO"},
+    )
+
+    if failed_condition is not None:
+        assert failed_condition in n16["artifact"]["failed_conditions"]
+        assert "模板准确度3/5低于4" in n16["artifact"]["decision_basis"]
+    assert n16["artifact"]["safety"] == safety
+    assert n17.outcome == "AUTO_DECIDED"
+    assert n17.output["admission_decision"] == "NOT_ADMIT"
+    assert n17.output["reason"]
 
 
 def test_low_variant_scores_force_search_quality_patch():

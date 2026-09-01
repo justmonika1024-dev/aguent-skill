@@ -87,6 +87,151 @@ _WORKFLOW_NODE_KEYS = {
     "N18", "N19", "N20",
 }
 
+_AUTO_ADMISSION_DIMENSION_THRESHOLDS = {
+    "fluency": 4,
+    "recognition": 4,
+    "agu_fit": 4,
+    "humor": 3,
+    "rhythm": 3,
+    "adaptation_restraint": 4,
+}
+_AUTO_ADMISSION_SCORE_THRESHOLD = 4.0
+
+
+def _artifact_payload(value: dict[str, Any], node_key: str) -> dict[str, Any]:
+    payload = value.get(node_key, {})
+    if isinstance(payload, dict) and isinstance(payload.get("llm"), dict):
+        payload = payload["llm"]
+    return payload if isinstance(payload, dict) else {}
+
+
+def _automatic_admission_input(value: dict[str, Any]) -> dict[str, Any]:
+    n09 = _artifact_payload(value, "N09")
+    n11 = _artifact_payload(value, "N11")
+    n11_5 = _artifact_payload(value, "N11.5")
+    n13 = _artifact_payload(value, "N13")
+    n14 = _artifact_payload(value, "N14")
+    n15 = _artifact_payload(value, "N15")
+
+    selected_id = str(n14.get("selected_candidate_id", ""))
+    selected_score = next((
+        score for score in n13.get("scores", [])
+        if isinstance(score, dict) and str(score.get("candidate_id", "")) == selected_id
+    ), {})
+    qualified_ids = {
+        str(candidate_id) for candidate_id in n13.get("qualified_candidate_ids", [])
+    }
+    final_text = str(n15.get("final_agu_text", ""))
+    action_affirmed = selected_score.get("action_affirmed")
+    if not isinstance(action_affirmed, bool):
+        action_affirmed = bool(
+            _ACTION_ON_AGU.search(final_text)
+            and not _has_action_on_other_object(final_text)
+        )
+    critical_failures = selected_score.get("critical_failures", [])
+    if isinstance(critical_failures, str):
+        critical_failures = [critical_failures]
+    elif not isinstance(critical_failures, list):
+        critical_failures = [str(critical_failures)] if critical_failures else []
+
+    dimension_scores: dict[str, float | None] = {}
+    for field in _AUTO_ADMISSION_DIMENSION_THRESHOLDS:
+        raw = selected_score.get(field)
+        dimension_scores[field] = (
+            float(raw)
+            if isinstance(raw, (int, float)) and not isinstance(raw, bool)
+            else None
+        )
+    complete_scores = [
+        score for score in dimension_scores.values() if score is not None
+    ]
+    candidate_average = (
+        sum(complete_scores) / len(_AUTO_ADMISSION_DIMENSION_THRESHOLDS)
+        if len(complete_scores) == len(_AUTO_ADMISSION_DIMENSION_THRESHOLDS)
+        else 0.0
+    )
+    safety_value = n15.get("content_safety", n15.get("safety", "PASS"))
+    if isinstance(safety_value, dict):
+        safety_value = safety_value.get("status", safety_value.get("result", "PASS"))
+    safety = str(safety_value).upper()
+
+    failures: list[tuple[str, str]] = []
+
+    def fail(code: str, message: str) -> None:
+        failures.append((code, message))
+
+    if n09.get("is_sufficient") is not True:
+        fail("N09_NOT_SUFFICIENT", "N09变式证据不充分")
+    if n11.get("decision") != "PASS":
+        fail("N11_NOT_PASS", "N11模板校验未通过")
+    accuracy = n11.get("accuracy")
+    if not isinstance(accuracy, (int, float)) or isinstance(accuracy, bool) or accuracy < 4:
+        fail("N11_ACCURACY_BELOW_4", f"模板准确度{accuracy}/5低于4")
+    coverage = n11.get("coverage")
+    if (not isinstance(coverage, (int, float)) or isinstance(coverage, bool)
+            or coverage < 0.8):
+        rendered_coverage = f"{coverage:.0%}" if isinstance(coverage, (int, float)) else str(coverage)
+        fail("N11_COVERAGE_BELOW_0_8", f"模板覆盖率{rendered_coverage}低于80%")
+    if n11_5.get("route") == "ABANDON_ORIGINAL" or not n11_5.get("route"):
+        fail("N11_5_ABANDONED", "N11.5未产出可用改写路由")
+    if not selected_score:
+        fail("N13_SELECTED_SCORE_MISSING", f"N13缺少最终候选{selected_id or 'UNKNOWN'}的评分")
+    elif not selected_score.get("qualified") or selected_id not in qualified_ids:
+        fail("N13_SELECTED_NOT_QUALIFIED", f"最终候选{selected_id}未通过N13合格门槛")
+    if not action_affirmed:
+        fail("N13_ACTION_NOT_AFFIRMED", f"最终候选{selected_id or 'UNKNOWN'}未确认凿agu动作")
+    if critical_failures:
+        fail("N13_CRITICAL_FAILURES", "N13存在严重失败：" + "、".join(map(str, critical_failures)))
+    for field, minimum in _AUTO_ADMISSION_DIMENSION_THRESHOLDS.items():
+        score = dimension_scores[field]
+        if score is None or score < minimum:
+            fail(
+                f"N13_{field.upper()}_BELOW_{minimum}",
+                f"最终候选{field}得分{score}低于{minimum}",
+            )
+    if candidate_average < _AUTO_ADMISSION_SCORE_THRESHOLD:
+        fail(
+            "N13_AVERAGE_BELOW_4",
+            f"最终候选六维均分{candidate_average:.2f}低于4.00",
+        )
+    if not final_text:
+        fail("N15_FINAL_TEXT_MISSING", "N15正式文案为空")
+    if safety != "PASS":
+        fail("CONTENT_SAFETY_NOT_PASS", f"内容安全结果为{safety}")
+
+    quality_failures = [
+        item for item in failures if item[0] != "CONTENT_SAFETY_NOT_PASS"
+    ]
+    score = candidate_average if not quality_failures else 0.0
+    if failures:
+        decision_basis = "自动准入未通过：" + "；".join(message for _, message in failures)
+    else:
+        decision_basis = (
+            f"自动准入通过：模板准确度{accuracy}/5、覆盖率{coverage:.0%}；"
+            f"最终候选{selected_id}六维均分{candidate_average:.2f}，全部硬条件满足。"
+        )
+    return {
+        "score": score,
+        "threshold": _AUTO_ADMISSION_SCORE_THRESHOLD,
+        "safety": safety,
+        "selected_candidate_id": selected_id,
+        "quality_components": {
+            "n09_is_sufficient": n09.get("is_sufficient"),
+            "template_decision": n11.get("decision"),
+            "template_accuracy": accuracy,
+            "template_coverage": coverage,
+            "route": n11_5.get("route"),
+            "candidate_scores": dimension_scores,
+            "candidate_average": candidate_average,
+            "candidate_qualified": selected_score.get("qualified"),
+            "action_affirmed": action_affirmed,
+            "critical_failures": critical_failures,
+            "final_text_present": bool(final_text),
+        },
+        "failed_conditions": [code for code, _ in failures],
+        "decision_basis": decision_basis,
+    }
+
 
 def _safe_feedback_text(value: Any) -> str:
     return " ".join(str(value or "").split())[:_MAX_FEEDBACK_TEXT_LENGTH]
@@ -1155,6 +1300,11 @@ class RealWorkflowNode:
                 "checked_formal_title_count": len(formal_titles),
                 "suspected_titles": suspected,
             }}
+        if self.key == "N16" and isinstance(value, dict):
+            return {
+                "outcome": "NOT_DUPLICATE",
+                "artifact": _automatic_admission_input(value),
+            }
         if self.key not in _LLM_NODES:
             return {"outcome": self.outcome, "artifact": {"node_key": self.key, "input_node_keys": list(value) if isinstance(value, dict) else []}}
         if self.key == "N05" and isinstance(value, dict):

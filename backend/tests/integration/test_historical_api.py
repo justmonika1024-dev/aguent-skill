@@ -10,23 +10,41 @@ from sqlalchemy import select
 from app.db.models import RunHumanEvaluation, RunStrategyPatch
 from app.db.persistence import SQLiteRepository
 from app.main import app
+from app.providers.fake import FakeLLMProvider, FakeSearchProvider
 from app.workflow.context import AdmissionMode, RunContext, RunMode, RunState
 from app.workflow.engine import WorkflowEngine
 from app.workflow.events import EventBus
-from app.workflow.registry import NodeRegistry
+from app.workflow.real_registry import build_real_registry
 
 
-class AdmissionInputN16:
-    key = "N16"
-
-    def __init__(self, automatic_decision: str) -> None:
-        self.score = 4 if automatic_decision == "ADMIT" else 3
-
-    async def execute(self, node_input, services):
-        return {
-            "outcome": "NOT_DUPLICATE",
-            "artifact": {"score": self.score, "threshold": 3.5, "safety": "PASS"},
-        }
+def automatic_admission_artifacts(automatic_decision: str) -> dict:
+    accuracy = 5 if automatic_decision == "ADMIT" else 3
+    selected_score = {
+        "candidate_id": "C1",
+        "fluency": 5,
+        "recognition": 5,
+        "agu_fit": 5,
+        "humor": 4,
+        "rhythm": 4,
+        "adaptation_restraint": 5,
+        "qualified": True,
+        "action_affirmed": True,
+        "critical_failures": [],
+    }
+    return {
+        "N09": {"llm": {"is_sufficient": True, "variants": [{}, {}, {}]}},
+        "N11": {"llm": {
+            "decision": "PASS", "accuracy": accuracy, "coverage": 0.9,
+        }},
+        "N11.5": {"llm": {"route": "STRUCTURE_PRESERVING_REWRITE"}},
+        "N13": {"llm": {
+            "scores": [selected_score], "qualified_candidate_ids": ["C1"],
+        }},
+        "N14": {"llm": {"selected_candidate_id": "C1"}},
+        "N15": {"llm": {
+            "final_agu_text": "他正在凿agu。", "content_safety": "PASS",
+        }},
+    }
 
 
 def modular_evaluation_payload(expected_run_version: int, branch_id: str) -> dict:
@@ -254,29 +272,38 @@ async def test_modular_evaluation_auto_override_persists_resolved_decision_and_f
     repository = SQLiteRepository(
         f"sqlite+aiosqlite:///{tmp_path / f'auto-{override}.db'}",
     )
-    registry = NodeRegistry()
-    registry.register(AdmissionInputN16(automatic_decision))
+    registry = build_real_registry(
+        llm=FakeLLMProvider(), search=FakeSearchProvider(), repository=repository,
+    )
     engine = WorkflowEngine(registry=registry, repository=repository)
     api_router = importlib.import_module("app.api.router")
     monkeypatch.setattr(api_router, "_engine", engine)
+    context = RunContext(
+        mode=RunMode.AUTO_DISCOVERY, admission_mode=AdmissionMode.AUTO,
+        current_node="N16", current_state=RunState.RUNNING,
+    )
+    context.active_artifacts.update(automatic_admission_artifacts(automatic_decision))
+    context.node_outputs.update(context.active_artifacts)
+    engine.contexts[context.run_id] = context
+    engine.buses[context.run_id] = EventBus()
+    await repository.create_run(context)
+    engine._tasks[context.run_id] = asyncio.create_task(engine._run(context))
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        created = await client.post("/api/v1/runs", json={
-            "mode": "AUTO_DISCOVERY",
-            "admission_mode": "AUTO",
-        })
-        run_id = created.json()["run_id"]
+        run_id = context.run_id
         for _ in range(400):
             snapshot = (await client.get(f"/api/v1/runs/{run_id}")).json()
             if snapshot["state"] == "WAITING_HUMAN_EVALUATION":
                 break
             await asyncio.sleep(0.005)
         assert snapshot["state"] == "WAITING_HUMAN_EVALUATION"
-        assert engine.contexts[run_id].node_outputs["N17"] == {
-            "admission_decision": automatic_decision,
-            "reason": "",
-            "safety": "PASS",
-        }
+        assert engine.contexts[run_id].node_outputs["N16"]["failed_conditions"] == (
+            [] if automatic_decision == "ADMIT" else ["N11_ACCURACY_BELOW_4"]
+        )
+        assert engine.contexts[run_id].node_outputs["N17"][
+            "admission_decision"
+        ] == automatic_decision
+        assert engine.contexts[run_id].node_outputs["N17"]["reason"]
         payload = modular_evaluation_payload(
             snapshot["run_version"], snapshot["active_branch_id"],
         )
