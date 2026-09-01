@@ -35,7 +35,7 @@ _OUTCOMES = {
 _LLM_NODES = {"N01", "N02", "N03", "N05", "N07", "N09", "N10", "N11", "N11.5", "N12", "N13", "N14", "N15", "N19"}
 
 _MAX_OUTPUT_TOKENS = {
-    "N01": 1500, "N02": 4000, "N03": 1600, "N05": 1800, "N09": 4000,
+    "N01": 1500, "N02": 4000, "N03": 1600, "N05": 1800, "N09": 2400,
     "N10": 1800, "N11": 1200, "N11.5": 1600, "N12": 6000,
     "N13": 4000, "N14": 1000, "N15": 1200, "N19": 1600,
 }
@@ -46,7 +46,7 @@ _INSTRUCTIONS = {
     "N03": "根据人工种子或自主发现方向制定原始梗搜索计划。输出 queries 数组，3到5条；每条含 query_id、query、search_type(keyword或auto)、purpose。查询必须包含具体原句锚点，不要只搜中文经典文案梗。",
     "N05": "从N04真实搜索结果中只选择一个可被反复改编的中文文案梗。输出 title、original_text、fixed_anchors、source_id、source_url、evidence_quote、selection_reason。original_text必须逐字来自某条结果的title或text，禁止编造。",
     "N07": "只围绕N05选中的唯一原始梗制定变式搜索。输出 queries 数组4到6条，含 query_id、query、search_type、purpose；至少使用两个固定锚点和原句片段，目标是网友替换槽位后的实际变式。",
-    "N09": "从N08真实结果中提取原始梗的网友变式。输出 variants 数组，每条含 variant_text、source_id、source_url、evidence_quote、shared_anchor；只接受可在对应搜索结果正文中逐字找到的文案，排除原文转载和无关内容。",
+    "N09": "从N08真实结果中提取原始梗的网友变式。最多输出8条 variants，每条含 variant_text、source_id、source_url、evidence_quote、shared_anchor；只接受可在对应搜索结果正文中逐字找到且发生实质槽位替换的文案，排除原文转载、繁简标点异写、标题释义包裹和长上下文。",
     "N10": "根据N05唯一原始梗和N09有效变式抽取模板。输出 canonical_template_text、fixed_segments、slots、evidence_variant_texts、template_explanation。模板必须能重建原句和多个变式，不得包含agu或凿。",
     "N11": "验证N10模板能否覆盖原始梗和变式。输出 decision(PASS/REEXTRACT/MORE_EVIDENCE)、coverage、accuracy、problems。",
     "N11.5": "判断模板如何自然改写为凿agu。agu是人物，凿是作用于agu的动作；凿agu也可以整体名词化为标题、主语或宾语。实施方可按模板逻辑映射为研发方、发明方、创作者或组织者。输出 route、must_preserve、may_rewrite、rewrite_blueprint；route只能DIRECT_SLOT_FILL或STRUCTURE_PRESERVING_REWRITE。",
@@ -236,7 +236,7 @@ def _compact_artifacts(node_key: str, value: dict[str, Any]) -> dict[str, Any]:
             anchors.append("你说得对，但是")
         compact_search = dict(result["N08"])
         compact_sources = []
-        for source in compact_search.get("sources", [])[:16]:
+        for source in compact_search.get("sources", []):
             item = dict(source)
             text = str(item.get("text", ""))
             excerpts: list[str] = []
@@ -255,10 +255,12 @@ def _compact_artifacts(node_key: str, value: dict[str, Any]) -> dict[str, Any]:
                     if excerpt and excerpt not in excerpts:
                         excerpts.append(excerpt)
                     start = index + len(anchor)
-            item["text"] = "\n".join(excerpts)[:1800]
+            item["text"] = "\n".join(excerpts)[:600]
             if item["text"]:
                 compact_sources.append(item)
-        compact_search["sources"] = compact_sources[:12]
+            if len(compact_sources) >= 8:
+                break
+        compact_search["sources"] = compact_sources[:8]
         compact_search.pop("results", None)
         result["N08"] = compact_search
     for search_key in ("N04", "N08"):
@@ -441,30 +443,127 @@ def _normalize_anchors(original: str, raw_anchors: Any) -> list[str]:
     return list(dict.fromkeys(anchors))[:8]
 
 
-def _variant_search_plan(original: str, anchors: list[str]) -> list[dict[str, str]]:
+def _variant_search_plan(
+    original: str,
+    anchors: list[str],
+    search_strategy: dict[str, Any] | None = None,
+    directives: list[str] | None = None,
+) -> list[dict[str, str]]:
     anchors = _normalize_anchors(original, anchors)
     primary = anchors[0] if anchors else original[:12]
     secondary = anchors[1] if len(anchors) > 1 else original[-8:]
-    if "你说的对，但是《" in original and "自主研发的一款" in original:
-        return [
-            {"query_id": "VQ1", "query": original, "search_type": "keyword", "purpose": "找整句和同页列举的变式"},
-            {"query_id": "VQ2", "query": '"你说的对，但是" "自主研发的一款"', "search_type": "auto", "purpose": "找同构替换版本"},
-            {"query_id": "VQ3", "query": '"你说得对，但是" "自主研发的一款"', "search_type": "auto", "purpose": "覆盖的/得异写的同构版本"},
-            {"query_id": "VQ4", "query": '"你说的对，但是" 衍生梗 完整版', "search_type": "auto", "purpose": "找梗百科列出的变式"},
-            {"query_id": "VQ5", "query": f'"{original[:12]}" 变式', "search_type": "keyword", "purpose": "找网友原文"},
-        ]
-    return [
-        {"query_id": "VQ1", "query": original, "search_type": "keyword", "purpose": "找整句和同页列举的变式"},
-        {"query_id": "VQ2", "query": f'"{primary}" 衍生梗', "search_type": "auto", "purpose": "找已存在衍生版本"},
-        {"query_id": "VQ3", "query": f'"{primary}" "{secondary}" 改编', "search_type": "auto", "purpose": "找保留共同锚点的网友改编"},
-        {"query_id": "VQ4", "query": f'"{original[:12]}" 变式', "search_type": "keyword", "purpose": "找网友原文"},
-        {"query_id": "VQ5", "query": f'"{primary}" 完整版 改编', "search_type": "auto", "purpose": "找汇总页中的实际变式"},
+    strategy = search_strategy if isinstance(search_strategy, dict) else {}
+    directives = list(dict.fromkeys(directives or []))
+    plan = [
+        {
+            "query_id": "VQ1", "query": original, "search_type": "keyword",
+            "purpose": "保留精确原句基线，用于识别并排除转载",
+            "strategy_origin": "BASELINE_EXACT_ORIGINAL",
+        },
+        {
+            "query_id": "VQ2", "query": f'"{primary}" "{secondary}" 网友改编',
+            "search_type": "auto", "purpose": "寻找保留两个固定锚点的槽位替换",
+            "strategy_origin": "FIXED_ANCHOR_SLOT_REPLACEMENT",
+        },
+        {
+            "query_id": "VQ3", "query": f'"{primary}" 换成 改编',
+            "search_type": "auto", "purpose": "寻找替换原句可变语境的槽位替换",
+            "strategy_origin": "REPLACEMENT_CONTEXT",
+        },
     ]
+    if strategy.get("prefer_ugc_sources"):
+        plan.append({
+            "query_id": "VQ4", "query": f'"{primary}" 论坛 微博 知乎 网友改编',
+            "search_type": "auto", "purpose": "优先定位论坛、微博、知乎等UGC来源",
+            "strategy_origin": "STRATEGY_PREFER_UGC",
+        })
+    for directive in directives[:2]:
+        query_hint = directive[:48]
+        plan.append({
+            "query_id": f"VQ{len(plan) + 1}",
+            "query": f'"{primary}" {query_hint}',
+            "search_type": "auto",
+            "purpose": "执行人工反馈指令并寻找槽位替换",
+            "strategy_origin": "FEEDBACK_DIRECTIVE",
+        })
+    fillers = [
+        (f'"{primary}" 衍生梗 网友原文', "定位网友发布的实际衍生文案", "UGC_VARIANT_FALLBACK"),
+        (f'"{primary}" "{secondary}" 变体', "补足固定锚点组合覆盖", "ANCHOR_COMBINATION_FALLBACK"),
+    ]
+    for query, purpose, origin in fillers:
+        if len(plan) >= 5:
+            break
+        plan.append({
+            "query_id": f"VQ{len(plan) + 1}", "query": query,
+            "search_type": "auto", "purpose": purpose, "strategy_origin": origin,
+        })
+    return plan[:6]
 
 
 def _normalize_meme_text(text: str) -> str:
     return re.sub(r"\s+", "", text.strip().replace("你说得对", "你说的对")
                   .replace("“", '"').replace("”", '"').rstrip("。！？!?"))
+
+
+_COMMON_TRADITIONAL_TO_SIMPLIFIED = str.maketrans({
+    "開": "开", "頭": "头", "卻": "却", "這": "这", "結": "结",
+    "網": "网", "絡": "络", "語": "语", "詞": "词", "義": "义",
+    "為": "为", "說": "说", "對": "对", "發": "发", "現": "现",
+    "實": "实", "體": "体", "來": "来", "時": "时", "個": "个",
+    "們": "们", "與": "与", "後": "后", "裡": "里", "從": "从",
+})
+_VARIANT_WRAPPER = re.compile(
+    r"(?:是什么意思|什么意思|意思是|含义|释义|赏析|解析|解读|出处|"
+    r"原句(?:是|：|:)?|句子赏析|标题|台词|这句话|这句|网络流行(?:语|词))",
+    re.IGNORECASE,
+)
+
+
+def _normalize_variant_compare(text: str) -> str:
+    normalized = text.translate(_COMMON_TRADITIONAL_TO_SIMPLIFIED)
+    normalized = normalized.replace("你说得对", "你说的对").casefold()
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]", "", normalized)
+
+
+def is_substantive_variant(
+    original: str, candidate: str, anchors: list[str],
+) -> bool:
+    """Return whether candidate changes a real slot instead of wrapping a repost."""
+    original_normalized = _normalize_variant_compare(original)
+    candidate_normalized = _normalize_variant_compare(candidate)
+    if not original_normalized or not candidate_normalized:
+        return False
+    if _VARIANT_WRAPPER.search(candidate):
+        return False
+    if (candidate_normalized == original_normalized
+            or original_normalized in candidate_normalized
+            or candidate_normalized in original_normalized):
+        return False
+    if len(candidate_normalized) > max(220, len(original_normalized) * 3):
+        return False
+    similarity = SequenceMatcher(
+        None, original_normalized, candidate_normalized,
+    ).ratio()
+    normalized_anchors = list(dict.fromkeys(
+        normalized for anchor in anchors
+        if (normalized := _normalize_variant_compare(anchor))
+    ))
+    shared_anchors = [
+        anchor for anchor in normalized_anchors
+        if anchor in original_normalized and anchor in candidate_normalized
+    ]
+    if similarity < 0.35 and not shared_anchors:
+        return False
+    original_slots = original_normalized
+    candidate_slots = candidate_normalized
+    for anchor in shared_anchors:
+        original_slots = original_slots.replace(anchor, "", 1)
+        candidate_slots = candidate_slots.replace(anchor, "", 1)
+    if similarity >= 0.9 and SequenceMatcher(
+        None, original_slots, candidate_slots,
+    ).ratio() >= 0.86:
+        return False
+    return bool(shared_anchors or similarity >= 0.45)
 
 
 def _normalize_duplicate_text(text: str) -> str:
@@ -523,7 +622,7 @@ def _supported_replaceable_prefix(original: str, variants: list[dict[str, Any]])
     return ""
 
 
-def _clean_variant_text(original: str, text: str) -> str | None:
+def _clean_variant_text(original: str, text: str, anchors: list[str]) -> str | None:
     text = text.strip()
     quoted = re.findall(r"[“「『]\s*([^”」』]{4,160}?)\s*[”」』]", text)
     if quoted:
@@ -563,10 +662,14 @@ def _clean_variant_text(original: str, text: str) -> str | None:
     if (original_normalized.startswith(text_normalized)
             and len(text_normalized) < len(original_normalized) * 0.7):
         return None
+    if not is_substantive_variant(original, text, anchors):
+        return None
     return text.rstrip("。！？!?")
 
 
-def _filter_verified_variants(original: str, variants: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _filter_verified_variants(
+    original: str, anchors: list[str], variants: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     noise = re.compile(r"(?:^\s*#|下载|购买|Steam|中文名|分享到|关注我们|最新进展|网络梗的一种|网络流行词|作为网络语|别名|拼音)", re.IGNORECASE)
     filtered: list[dict[str, Any]] = []
     per_url: dict[str, int] = {}
@@ -576,7 +679,7 @@ def _filter_verified_variants(original: str, variants: list[dict[str, Any]]) -> 
         url = str(variant.get("source_url", ""))
         if not text or len(text) > 220 or noise.search(text) or _STOREFRONT_SOURCE.search(url):
             continue
-        cleaned_text = _clean_variant_text(original, text)
+        cleaned_text = _clean_variant_text(original, text, anchors)
         if cleaned_text is None:
             continue
         text = cleaned_text
@@ -592,7 +695,7 @@ def _filter_verified_variants(original: str, variants: list[dict[str, Any]]) -> 
                 continue
         if per_url.get(url, 0) >= 3:
             continue
-        normalized_text = _normalize_duplicate_text(text)
+        normalized_text = _normalize_variant_compare(text)
         evidence_key = (normalized_text, url)
         if evidence_key in seen_evidence:
             continue
@@ -601,9 +704,40 @@ def _filter_verified_variants(original: str, variants: list[dict[str, Any]]) -> 
         filtered.append(cleaned_variant)
         seen_evidence.add(evidence_key)
         per_url[url] = per_url.get(url, 0) + 1
-        if len(filtered) >= 20:
+        if len(filtered) >= 8:
             break
     return filtered
+
+
+_MAX_VARIANT_SEARCH_RETRIES = 2
+
+
+def _bounded_variant_fallback(
+    services: Any,
+    original: str,
+    *,
+    retry_outcome: str,
+    reason: str,
+) -> tuple[str, dict[str, Any]]:
+    strategy_snapshot = (
+        services.get("strategy_snapshot") if isinstance(services, dict) else None
+    )
+    counters = getattr(strategy_snapshot, "loop_counters", None)
+    key = f"variant_search:{original}"
+    current = int(counters.get(key, 0)) if isinstance(counters, dict) else 0
+    if current >= _MAX_VARIANT_SEARCH_RETRIES:
+        outcome = "ABANDON_ORIGINAL"
+        count = current
+    else:
+        count = current + 1
+        if isinstance(counters, dict):
+            counters[key] = count
+        outcome = retry_outcome
+    return outcome, {
+        "count": count,
+        "threshold": _MAX_VARIANT_SEARCH_RETRIES,
+        "reason": reason,
+    }
 
 
 _PRODUCT_TEMPLATE = "你说的对，但是《{主题}》是由{研发方}自主研发的一款{后续描述}。"
@@ -799,11 +933,14 @@ class RealWorkflowNode:
                 for item in search_strategy.get("variant_query_directives", [])
                 if isinstance(item, str) and _safe_feedback_text(item)
             ] if isinstance(search_strategy, dict) else []
-            parsed = {"queries": _variant_search_plan(original, anchors)}
+            directives = list(dict.fromkeys(directives))
+            parsed = {"queries": _variant_search_plan(
+                original, anchors, search_strategy, directives,
+            )}
             return {"outcome": self.outcome, "artifact": {
                 "llm": parsed,
-                "planning_mode": "DETERMINISTIC_FROM_N05",
-                "applied_directives": list(dict.fromkeys(directives)),
+                "planning_mode": "STRATEGY_GUIDED",
+                "applied_directives": directives,
                 "strategy_version_id": services.get("strategy_version_id")
                 if isinstance(services, dict) else None,
             }}
@@ -947,7 +1084,28 @@ class RealWorkflowNode:
             original = original_node.get("original_text", "") if isinstance(original_node, dict) else ""
             variants = variants_node.get("variants", []) if isinstance(variants_node, dict) else []
             template = template_node.get("canonical_template_text", "") if isinstance(template_node, dict) else ""
-            _validate_template(template, original, variants)
+            try:
+                _validate_template(template, original, variants)
+            except ValueError as exc:
+                if "at least two verified variants" not in str(exc):
+                    raise
+                outcome, fallback = _bounded_variant_fallback(
+                    services,
+                    str(original),
+                    retry_outcome="MORE_EVIDENCE",
+                    reason="N11_MORE_EVIDENCE",
+                )
+                return {"outcome": outcome, "artifact": {
+                    "llm": {
+                        "decision": "MORE_EVIDENCE",
+                        "coverage": 0.0,
+                        "accuracy": 0,
+                        "matched_variant_count": 0,
+                        "problems": [str(exc)],
+                    },
+                    "validation_mode": "BOUNDED_MORE_EVIDENCE",
+                    "fallback": fallback,
+                }}
             pattern = _template_pattern(template)
             matched = sum(pattern.fullmatch(_normalize_meme_text(str(variant.get("variant_text", "")).split("。", 1)[0])) is not None
                           for variant in variants)
@@ -1117,7 +1275,34 @@ class RealWorkflowNode:
         ):
             payload["formal_meme_titles"] = await self.repository.list_formal_meme_titles()
         output_schema: dict[str, Any] = {"type": "object", "additionalProperties": True}
-        if self.key == "N19":
+        if self.key == "N09":
+            output_schema = {
+                "type": "object",
+                "properties": {
+                    "variants": {
+                        "type": "array",
+                        "maxItems": 8,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "variant_text": {"type": "string"},
+                                "source_id": {"type": "string"},
+                                "source_url": {"type": "string"},
+                                "evidence_quote": {"type": "string"},
+                                "shared_anchor": {"type": "string"},
+                            },
+                            "required": [
+                                "variant_text", "source_id", "source_url",
+                                "evidence_quote", "shared_anchor",
+                            ],
+                            "additionalProperties": True,
+                        },
+                    },
+                },
+                "required": ["variants"],
+                "additionalProperties": True,
+            }
+        elif self.key == "N19":
             output_schema = {
                 "type": "object",
                 "properties": {
@@ -1304,17 +1489,31 @@ class RealWorkflowNode:
                 sources = value.get("N08", {}).get("sources", []) if isinstance(value, dict) else []
                 by_id = {s.get("source_id"): s for s in sources}
                 valid = []
-                for variant in parsed.get("variants", []):
-                    source = by_id.get(variant.get("source_id")); quote = variant.get("evidence_quote", "")
-                    if source and quote and quote in source.get("title", "") + "\n" + source.get("text", ""):
-                        valid.append(variant)
+                for variant in parsed.get("variants", [])[:8]:
+                    if not isinstance(variant, dict):
+                        continue
+                    source = by_id.get(variant.get("source_id"))
+                    quote = str(variant.get("evidence_quote", ""))
+                    variant_text = str(variant.get("variant_text", ""))
+                    haystack = (
+                        str(source.get("title", "")) + "\n" + str(source.get("text", ""))
+                        if source else ""
+                    )
+                    if source and quote and variant_text and quote in haystack and variant_text in haystack:
+                        item = dict(variant)
+                        item["source_url"] = source.get("url", "")
+                        valid.append(item)
                 selected = value.get("N05", {}) if isinstance(value, dict) else {}
                 selected = selected.get("llm", selected) if isinstance(selected, dict) else {}
                 anchors = selected.get("fixed_anchors", []) if isinstance(selected, dict) else []
-                anchor = next((a for a in anchors if len(a) >= 4), "")
-                anchor_candidates = [anchor]
-                if "你说的对" in anchor:
-                    anchor_candidates.append(anchor.replace("你说的对", "你说得对"))
+                anchor_candidates = [
+                    str(anchor) for anchor in anchors
+                    if isinstance(anchor, str) and len(anchor) >= 4
+                ]
+                for anchor in list(anchor_candidates):
+                    if "你说的对" in anchor:
+                        anchor_candidates.append(anchor.replace("你说的对", "你说得对"))
+                anchor_candidates = list(dict.fromkeys(anchor_candidates))
                 for source in sources:
                     chunks = [x.strip() for x in re.split(r"[。\n]", source.get("text", "")) if x.strip()]
                     for chunk in chunks:
@@ -1326,15 +1525,36 @@ class RealWorkflowNode:
                 dedup: dict[tuple[str, str], dict[str, Any]] = {}
                 for variant in valid:
                     dedup.setdefault((
-                        re.sub(r"\s+", "", variant.get("variant_text", "")),
+                        _normalize_variant_compare(str(variant.get("variant_text", ""))),
                         str(variant.get("source_url", "")),
                     ), variant)
                 original = selected.get("original_text", "") if isinstance(selected, dict) else ""
-                valid = _filter_verified_variants(original, list(dedup.values()))
+                valid = _filter_verified_variants(
+                    str(original), list(anchors), list(dedup.values()),
+                )
                 parsed["variants"] = valid
-                parsed["is_sufficient"] = len({v.get("variant_text") for v in valid}) >= 3 and len({v.get("source_url") for v in valid}) >= 2
+                parsed["is_sufficient"] = (
+                    len({
+                        _normalize_variant_compare(str(v.get("variant_text", "")))
+                        for v in valid
+                    }) >= 3
+                    and len({v.get("source_url") for v in valid if v.get("source_url")}) >= 2
+                )
                 if not parsed["is_sufficient"]:
-                    raise ValueError("N09 has insufficient verified variant evidence")
+                    outcome, fallback = _bounded_variant_fallback(
+                        services,
+                        str(original),
+                        retry_outcome="INSUFFICIENT",
+                        reason="N09_INSUFFICIENT_VARIANTS",
+                    )
+                    artifact = {
+                        "llm": parsed,
+                        "provider_request_id": result.provider_request_id if result else None,
+                        "fallback": fallback,
+                    }
+                    if extraction_mode:
+                        artifact["extraction_mode"] = extraction_mode
+                    return {"outcome": outcome, "artifact": artifact}
                 outcome = "SUFFICIENT"
             elif self.key == "N10":
                 template = parsed.get("canonical_template_text", "")

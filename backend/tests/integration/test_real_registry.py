@@ -4,6 +4,8 @@ import pytest
 
 from app.providers.base import SearchBatch, SearchResult
 from app.providers.fake import FakeLLMProvider, FakeSearchProvider
+from app.workflow import real_registry
+from app.workflow.context import AdmissionMode, RunContext, RunMode
 from app.workflow.real_registry import (
     _compact_artifacts,
     build_real_registry,
@@ -830,6 +832,56 @@ async def test_n07_builds_variant_queries_from_selected_original_without_llm_dep
     assert llm.requests == []
 
 
+@pytest.mark.parametrize(("candidate", "expected"), [
+    ("我猜中了开头，却猜不中这结局", False),
+    ("我猜中了開頭，卻猜不中這結局", False),
+    ("我猜中了开头，却猜不中这结局是什么意思", False),
+    ("句子赏析：我猜中了开头，却猜不中这结局", False),
+    ("我猜中了开头，却猜不中agu被谁凿了", True),
+    ("今天看到一句话，我猜中了开头，却猜不中这结局，真的很有感触", False),
+])
+def test_substantive_variant_filter(candidate, expected):
+    assert real_registry.is_substantive_variant(
+        "我猜中了开头，却猜不中这结局",
+        candidate,
+        ["我猜中了", "却猜不中"],
+    ) is expected
+
+
+@pytest.mark.asyncio
+async def test_n07_strategy_query_uses_feedback_and_ugc_preference():
+    llm = FakeLLMProvider()
+    registry = build_real_registry(llm=llm, search=FakeSearchProvider())
+    directive = "优先搜索论坛帖子里的网友槽位替换，排除百科释义"
+
+    result = await registry.get("N07").execute({
+        "N05": {
+            "original_text": "我猜中了开头，却猜不中这结局",
+            "fixed_anchors": ["我猜中了", "却猜不中"],
+        },
+    }, {
+        "strategy_version_id": "strategy-v2",
+        "strategy_snapshot": {"search": {
+            "prefer_ugc_sources": True,
+            "require_slot_replacement": True,
+            "variant_query_directives": [directive],
+        }},
+    })
+
+    artifact = result["artifact"]
+    queries = artifact["llm"]["queries"]
+    assert artifact["planning_mode"] == "STRATEGY_GUIDED"
+    assert artifact["strategy_version_id"] == "strategy-v2"
+    assert artifact["applied_directives"] == [directive]
+    assert 4 <= len(queries) <= 6
+    assert sum(item["query"] == "我猜中了开头，却猜不中这结局" for item in queries) == 1
+    assert any("槽位替换" in item["purpose"] for item in queries)
+    assert any("UGC" in item["purpose"] for item in queries)
+    assert any("论坛" in item["query"] for item in queries)
+    assert all(item["strategy_origin"] for item in queries)
+    assert llm.requests == []
+
+
 @pytest.mark.asyncio
 async def test_n05_normalizes_template_string_fixed_anchors_into_literal_segments():
     original = "你说的对，但是《原神》是由米哈游自主研发的一款开放世界冒险游戏。"
@@ -1328,6 +1380,106 @@ async def test_n09_falls_back_to_verified_anchor_extraction_after_model_json_fai
 
 
 @pytest.mark.asyncio
+async def test_n09_strict_fallback_returns_insufficient_for_reprints_and_explanations():
+    original = "我猜中了开头，却猜不中这结局"
+    sources = [
+        {"source_id": "V1", "url": "https://a.example/1", "title": "原句转载", "text": original},
+        {"source_id": "V2", "url": "https://b.example/2", "title": "繁体转载", "text": "我猜中了開頭，卻猜不中這結局"},
+        {"source_id": "V3", "url": "https://c.example/3", "title": "释义", "text": original + "是什么意思"},
+    ]
+    registry = build_real_registry(llm=FailingLLM(), search=FakeSearchProvider())
+
+    result = await registry.get("N09").execute({
+        "N05": {"original_text": original, "fixed_anchors": ["我猜中了", "却猜不中"]},
+        "N08": {"sources": sources},
+    }, None)
+
+    assert result["outcome"] == "INSUFFICIENT"
+    assert result["artifact"]["llm"]["variants"] == []
+    assert result["artifact"]["llm"]["is_sufficient"] is False
+    assert result["artifact"]["extraction_mode"] == "DETERMINISTIC_AFTER_LLM_FAILURE"
+
+
+@pytest.mark.asyncio
+async def test_n09_limits_structured_extraction_to_eight_sources_and_variants():
+    original = "我猜中了开头，却猜不中这结局"
+    variants = [
+        f"我猜中了开头，却猜不中第{i}个结局"
+        for i in range(1, 13)
+    ]
+    sources = [
+        {"source_id": f"V{i}", "url": f"https://forum.example/{i}", "title": f"网友改编{i}", "text": variant}
+        for i, variant in enumerate(variants, 1)
+    ]
+    llm = FakeLLMProvider(responses=[{"variants": [{
+        "variant_text": variant,
+        "source_id": f"V{i}",
+        "source_url": f"https://forum.example/{i}",
+        "evidence_quote": variant,
+        "shared_anchor": "我猜中了",
+    } for i, variant in enumerate(variants[:8], 1)]}])
+    registry = build_real_registry(llm=llm, search=FakeSearchProvider())
+
+    result = await registry.get("N09").execute({
+        "N05": {"original_text": original, "fixed_anchors": ["我猜中了", "却猜不中"]},
+        "N08": {"sources": sources},
+    }, None)
+
+    sent_sources = llm.requests[0].user_payload["artifacts"]["N08"]["sources"]
+    assert len(sent_sources) == 8
+    assert len(result["artifact"]["llm"]["variants"]) <= 8
+
+
+@pytest.mark.asyncio
+async def test_n09_and_n11_share_two_variant_search_retries_per_original():
+    original = "我猜中了开头，却猜不中这结局"
+    context = RunContext(
+        mode=RunMode.MANUAL_SEED,
+        admission_mode=AdmissionMode.HUMAN,
+        strategy_snapshot={"search": {}},
+    )
+    services = {"strategy_snapshot": context.strategy_snapshot}
+    registry = build_real_registry(llm=FailingLLM(), search=FakeSearchProvider())
+    insufficient_input = {
+        "N05": {"original_text": original, "fixed_anchors": ["我猜中了", "却猜不中"]},
+        "N08": {"sources": []},
+    }
+
+    first = await registry.get("N09").execute(insufficient_input, services)
+    assert first["outcome"] == "INSUFFICIENT"
+    assert first["artifact"]["fallback"] == {
+        "count": 1,
+        "threshold": 2,
+        "reason": "N09_INSUFFICIENT_VARIANTS",
+    }
+
+    invalid_template_input = {
+        "N05": {"original_text": original},
+        "N09": {"variants": [
+            {"variant_text": "我猜中了开头，却猜不中agu被谁凿了"},
+            {"variant_text": "我猜中了开头，却猜不中是谁先动的手"},
+            {"variant_text": "我猜中了开头，却猜不中群友最后凿了谁"},
+        ]},
+        "N10": {
+            "canonical_template_text": "我猜中了{前半句}，却猜不中这结局",
+        },
+    }
+    second = await registry.get("N11").execute(invalid_template_input, services)
+    assert second["outcome"] == "MORE_EVIDENCE"
+    assert second["artifact"]["fallback"]["count"] == 2
+
+    exhausted = await registry.get("N09").execute(insufficient_input, services)
+    assert exhausted["outcome"] == "ABANDON_ORIGINAL"
+    assert exhausted["artifact"]["fallback"] == {
+        "count": 2,
+        "threshold": 2,
+        "reason": "N09_INSUFFICIENT_VARIANTS",
+    }
+    assert context.loop_counters[f"variant_search:{original}"] == 2
+    assert context.snapshot()["loop_counters"] == {f"variant_search:{original}": 2}
+
+
+@pytest.mark.asyncio
 async def test_n09_preserves_independent_url_that_corrobates_a_duplicate_variant():
     variants = [
         "你说的对，但是《烟神》是由丁真自主研发的一款开放世界冒险游戏。",
@@ -1408,7 +1560,7 @@ async def test_n09_keeps_actual_rewrites_and_rejects_definition_or_generator_evi
     sources = [
         {"source_id": "V1", "url": "https://forum.example/1", "title": "网友衍生", "text": "大e了没有闪"},
         {"source_id": "V2", "url": "https://forum.example/2", "title": "谐音改编", "text": "我大姨来了，没油闪"},
-        {"source_id": "V3", "url": "https://wiki.example/3", "title": "用法举例", "text": "比如输了可以说：“我大意了，没有闪，年轻人不讲武德，偷袭我”"},
+        {"source_id": "V3", "url": "https://forum.example/3", "title": "网友变式", "text": "我大意了，没带闪"},
         {"source_id": "V4", "url": "https://wiki.example/4", "title": "词语解释", "text": "我大意了，没有闪这句话是网络流行语，意思是自己失误。"},
         {"source_id": "V5", "url": "https://memes.tw/maker/template/5", "title": "梗图生成器", "text": "我大意了阿，没有闪"},
     ]
@@ -1434,7 +1586,7 @@ async def test_n09_keeps_actual_rewrites_and_rejects_definition_or_generator_evi
     assert texts == [
         "大e了没有闪",
         "我大姨来了，没油闪",
-        "我大意了，没有闪，年轻人不讲武德，偷袭我",
+        "我大意了，没带闪",
     ]
 
 

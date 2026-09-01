@@ -1,10 +1,11 @@
 
+import httpx
 import pytest
 
 from app.providers.base import NodeLLMRequest, ParameterProfile
 from app.providers.exa import canonicalize_url
 from app.providers.fake import FakeLLMProvider
-from app.providers.llm import _json_text
+from app.providers.llm import DeepSeekChatProvider, _json_text
 from app.workflow.nodes.contracts import (
     N03SearchPlan,
     N09EvidenceEvaluation,
@@ -42,6 +43,61 @@ def test_exa_url_cleaning_and_n03_rules():
 
 def test_llm_parser_accepts_markdown_json_fence():
     assert _json_text('```json\n{"ok": true}\n```') == {"ok": True}
+
+
+@pytest.mark.asyncio
+async def test_deepseek_http_error_includes_provider_response_message():
+    async def reject(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, request=request, json={
+            "error": {"code": "InvalidParameter", "message": "input is too long"},
+        })
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(reject))
+    provider = DeepSeekChatProvider("secret", "deepseek-v4-flash", client=client)
+    request = NodeLLMRequest(
+        node_key="N05", system_prompt="return json", user_payload={},
+        output_schema={"type": "object"}, schema_name="N05",
+    )
+
+    try:
+        with pytest.raises(httpx.HTTPStatusError, match="input is too long"):
+            await provider.generate(request)
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_deepseek_json_error_reports_safe_finish_diagnostics():
+    raw = "not-json:" + ("x" * 400) + ":response-tail"
+
+    async def malformed(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, request=request, json={
+            "id": "response-id",
+            "choices": [{
+                "message": {"content": raw},
+                "finish_reason": "length",
+            }],
+        })
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(malformed))
+    provider = DeepSeekChatProvider("super-secret-api-key", "deepseek-v4-flash", client=client)
+    request = NodeLLMRequest(
+        node_key="N09", system_prompt="return json", user_payload={},
+        output_schema={"type": "object"}, schema_name="N09",
+    )
+
+    try:
+        with pytest.raises(ValueError) as caught:
+            await provider.generate(request)
+    finally:
+        await client.aclose()
+
+    message = str(caught.value)
+    assert "finish_reason=length" in message
+    assert f"raw_response_chars={len(raw)}" in message
+    assert "response-tail" in message
+    assert "super-secret-api-key" not in message
+    assert len(message) < 700
 
 
 def test_n11_5_threshold_and_n12_five_candidates_contract():

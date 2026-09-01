@@ -49,7 +49,9 @@ class TransitionTable:
         if node == "N20":
             return "N02" if continuous else None
         if outcome == "ABANDON_ORIGINAL":
-            return "N02" if mode == "AUTO_DISCOVERY" else "N03"
+            if mode == "AUTO_DISCOVERY":
+                return "N02"
+            return "WAITING_HUMAN_INTERVENTION" if node in {"N09", "N11"} else "N03"
         return None
 
     calculate_next = next

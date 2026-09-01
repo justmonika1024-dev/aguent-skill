@@ -43,6 +43,17 @@ def utcnow() -> datetime:
     return datetime.now(UTC)
 
 
+class RuntimeStrategySnapshot(dict[str, Any]):
+    """Strategy data plus run-local state that must not enter persisted JSON."""
+
+    def __init__(self, value: dict[str, Any], loop_counters: dict[str, int]) -> None:
+        super().__init__(value)
+        self.loop_counters = loop_counters
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> dict[str, Any]:
+        return deepcopy(dict(self), memo)
+
+
 @dataclass
 class RunContext:
     run_id: str = field(default_factory=lambda: str(uuid4()))
@@ -69,6 +80,18 @@ class RunContext:
     started_at: datetime = field(default_factory=utcnow)
     ended_at: datetime | None = None
 
+    def __post_init__(self) -> None:
+        self.strategy_snapshot = RuntimeStrategySnapshot(
+            self.strategy_snapshot, self.loop_counters,
+        )
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if (name == "strategy_snapshot" and isinstance(value, dict)
+                and not isinstance(value, RuntimeStrategySnapshot)
+                and "loop_counters" in self.__dict__):
+            value = RuntimeStrategySnapshot(value, self.loop_counters)
+        super().__setattr__(name, value)
+
     @property
     def state(self) -> RunState:
         return self.current_state
@@ -86,6 +109,7 @@ class RunContext:
             "active_branch_id": self.active_branch_id,
             "strategy_version_id": self.strategy_version_id,
             "strategy_snapshot": deepcopy(self.strategy_snapshot),
+            "loop_counters": deepcopy(self.loop_counters),
             "retry_available": self.retry_available,
         }
 

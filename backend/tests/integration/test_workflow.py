@@ -11,6 +11,7 @@ from app.workflow.context import AdmissionMode, RunMode, RunState
 from app.workflow.engine import WorkflowConflict, WorkflowEngine
 from app.workflow.events import Command, EventBus
 from app.workflow.registry import NodeRegistry
+from app.workflow.transitions import TransitionTable
 
 
 class FakeNode:
@@ -69,6 +70,16 @@ class InvalidFeedbackN19(FakeNode):
                 "next_round_hypotheses": [],
             },
         }
+
+
+@pytest.mark.parametrize(("mode", "expected"), [
+    (RunMode.AUTO_DISCOVERY, "N02"),
+    (RunMode.MANUAL_SEED, "WAITING_HUMAN_INTERVENTION"),
+])
+def test_variant_search_limit_routes_auto_and_manual_differently(mode, expected):
+    assert TransitionTable().next(
+        "N09", "ABANDON_ORIGINAL", mode=mode.value,
+    ) == expected
 
 
 @pytest.mark.asyncio
