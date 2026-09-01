@@ -569,12 +569,50 @@ _VARIANT_WRAPPER = re.compile(
 def _canonical_original_key(text: str) -> str:
     normalized = unicodedata.normalize("NFKC", str(text))
     normalized = normalized.translate(_COMMON_TRADITIONAL_TO_SIMPLIFIED)
-    return _normalize_meme_text(normalized).casefold()
+    normalized = _normalize_meme_text(normalized).casefold()
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]", "", normalized)
 
 
 def _normalize_variant_compare(text: str) -> str:
-    normalized = _canonical_original_key(text)
-    return re.sub(r"[^0-9a-z\u4e00-\u9fff]", "", normalized)
+    return _canonical_original_key(text)
+
+
+def _is_near_glyph_reprint(original_key: str, candidate_key: str) -> bool:
+    """Detect conservative Han-only reprints missed by the finite glyph map."""
+    if len(original_key) < 6 or len(candidate_key) < len(original_key):
+        return False
+    if re.fullmatch(r"[\u4e00-\u9fff]+", original_key) is None:
+        return False
+    max_differences = max(1, min(3, len(original_key) // 5))
+    for start in range(len(candidate_key) - len(original_key) + 1):
+        window = candidate_key[start:start + len(original_key)]
+        if re.fullmatch(r"[\u4e00-\u9fff]+", window) is None:
+            continue
+        differences = sum(
+            left != right for left, right in zip(original_key, window, strict=True)
+        )
+        if (2 <= differences <= max_differences
+                and SequenceMatcher(None, original_key, window).ratio() >= 0.8):
+            return True
+    return False
+
+
+def _same_original_identity(left_key: str, right_key: str) -> bool:
+    if not left_key or not right_key:
+        return False
+    return left_key == right_key or (
+        len(left_key) == len(right_key)
+        and _is_near_glyph_reprint(left_key, right_key)
+    )
+
+
+def _unique_identity_count(values: list[str]) -> int:
+    identities: list[str] = []
+    for value in values:
+        key = _canonical_original_key(value)
+        if key and not any(_same_original_identity(key, seen) for seen in identities):
+            identities.append(key)
+    return len(identities)
 
 
 def is_substantive_variant(
@@ -590,6 +628,8 @@ def is_substantive_variant(
     if (candidate_normalized == original_normalized
             or original_normalized in candidate_normalized
             or candidate_normalized in original_normalized):
+        return False
+    if _is_near_glyph_reprint(original_normalized, candidate_normalized):
         return False
     if len(candidate_normalized) > max(220, len(original_normalized) * 3):
         return False
@@ -628,6 +668,8 @@ def _duplicate_similarity(left: str, right: str) -> float:
     right_normalized = _normalize_duplicate_text(right)
     if not left_normalized or not right_normalized:
         return 0.0
+    if _same_original_identity(left_normalized, right_normalized):
+        return 1.0
     if min(len(left_normalized), len(right_normalized)) >= 6 and (
         left_normalized in right_normalized or right_normalized in left_normalized
     ):
@@ -725,7 +767,7 @@ def _filter_verified_variants(
     noise = re.compile(r"(?:^\s*#|下载|购买|Steam|中文名|分享到|关注我们|最新进展|网络梗的一种|网络流行词|作为网络语|别名|拼音)", re.IGNORECASE)
     filtered: list[dict[str, Any]] = []
     per_url: dict[str, int] = {}
-    seen_evidence: set[tuple[str, str]] = set()
+    seen_evidence: list[tuple[str, str]] = []
     for variant in variants:
         text = str(variant.get("variant_text", "")).strip()
         url = str(variant.get("source_url", ""))
@@ -749,12 +791,15 @@ def _filter_verified_variants(
             continue
         normalized_text = _normalize_variant_compare(text)
         evidence_key = (normalized_text, url)
-        if evidence_key in seen_evidence:
+        if any(
+            seen_url == url and _same_original_identity(normalized_text, seen_text)
+            for seen_text, seen_url in seen_evidence
+        ):
             continue
         cleaned_variant = dict(variant)
         cleaned_variant["variant_text"] = text
         filtered.append(cleaned_variant)
-        seen_evidence.add(evidence_key)
+        seen_evidence.append(evidence_key)
         per_url[url] = per_url.get(url, 0) + 1
         if len(filtered) >= 8:
             break
@@ -773,47 +818,84 @@ def _runtime_exhausted_originals(services: Any) -> list[str]:
         values = strategy_snapshot.get("exhausted_originals")
     if not isinstance(values, list):
         return []
-    return list(dict.fromkeys(
-        _canonical_original_key(value) for value in values
-        if isinstance(value, str) and _canonical_original_key(value)
-    ))
+    exhausted: list[str] = []
+    for value in values:
+        key = _canonical_original_key(value) if isinstance(value, str) else ""
+        if key and not any(_same_original_identity(key, seen) for seen in exhausted):
+            exhausted.append(key)
+    return exhausted
+
+
+def _is_exhausted_fragment(fragment: str, exhausted_keys: list[str]) -> bool:
+    fragment_key = _canonical_original_key(fragment)
+    return bool(fragment_key) and any(
+        exhausted in fragment_key
+        or _is_near_glyph_reprint(exhausted, fragment_key)
+        for exhausted in exhausted_keys
+    )
+
+
+def _evidence_fragments(text: str) -> list[str]:
+    return [
+        fragment.strip()
+        for fragment in re.split(r"(?<=[。！？!?；;])|[\r\n]+", text)
+        if _canonical_original_key(fragment)
+    ]
 
 
 def _filter_exhausted_sources(
     sources: list[dict[str, Any]], exhausted_originals: list[str],
 ) -> tuple[list[dict[str, Any]], int]:
     exhausted_keys = [
-        _normalize_variant_compare(original) for original in exhausted_originals
-        if len(_normalize_variant_compare(original)) >= 6
+        key for original in exhausted_originals
+        if len(key := _canonical_original_key(original)) >= 6
     ]
     if not exhausted_keys:
         return list(sources), 0
     eligible: list[dict[str, Any]] = []
     filtered_count = 0
     for source in sources:
-        evidence = _normalize_variant_compare(
-            str(source.get("title", "")) + "\n" + str(source.get("text", "")),
-        )
-        if any(original in evidence for original in exhausted_keys):
+        title = str(source.get("title", ""))
+        title_exhausted = _is_exhausted_fragment(title, exhausted_keys)
+        fragments = _evidence_fragments(str(source.get("text", "")))
+        remaining_fragments = [
+            fragment for fragment in fragments
+            if not _is_exhausted_fragment(fragment, exhausted_keys)
+        ]
+        removed_fragment_count = len(fragments) - len(remaining_fragments)
+        if title_exhausted or removed_fragment_count:
             filtered_count += 1
-        else:
-            eligible.append(source)
+        remaining_title = "" if title_exhausted else title
+        has_candidate = bool(remaining_fragments) or (
+            not title_exhausted
+            and len(_canonical_original_key(remaining_title)) >= 6
+        )
+        if not has_candidate:
+            continue
+        sanitized = dict(source)
+        sanitized["title"] = remaining_title
+        sanitized["text"] = "\n".join(remaining_fragments)
+        eligible.append(sanitized)
     return eligible, filtered_count
 
 
 def _remove_exhausted_originals(
     parsed: dict[str, Any], exhausted_originals: list[str],
 ) -> None:
-    excluded = {
-        _normalize_variant_compare(original) for original in exhausted_originals
-    }
+    excluded = [
+        _canonical_original_key(original) for original in exhausted_originals
+        if _canonical_original_key(original)
+    ]
     for field_name in ("known_example_phrases", "possible_original_phrases"):
         values = parsed.get(field_name)
         if isinstance(values, list):
             parsed[field_name] = [
                 value for value in values
                 if not isinstance(value, str)
-                or _normalize_variant_compare(value) not in excluded
+                or not any(
+                    _same_original_identity(_canonical_original_key(value), original)
+                    for original in excluded
+                )
             ]
 
 
@@ -830,6 +912,15 @@ def _bounded_variant_fallback(
     counters = getattr(strategy_snapshot, "loop_counters", None)
     original_key = _canonical_original_key(original)
     key = f"variant_search:{original_key}"
+    if isinstance(counters, dict):
+        key = next((
+            existing_key for existing_key in counters
+            if existing_key.startswith("variant_search:")
+            and _same_original_identity(
+                _canonical_original_key(existing_key.removeprefix("variant_search:")),
+                original_key,
+            )
+        ), key)
     current = int(counters.get(key, 0)) if isinstance(counters, dict) else 0
     if current >= _MAX_VARIANT_SEARCH_RETRIES:
         outcome = "ABANDON_ORIGINAL"
@@ -838,10 +929,12 @@ def _bounded_variant_fallback(
             strategy_snapshot, "exhausted_originals", None,
         )
         if (isinstance(exhausted_originals, list) and original_key
-                and original_key not in {
-                    _canonical_original_key(value)
+                and not any(
+                    _same_original_identity(
+                        original_key, _canonical_original_key(value),
+                    )
                     for value in exhausted_originals if isinstance(value, str)
-                }):
+                )):
             exhausted_originals.append(original_key)
     else:
         count = current + 1
@@ -1649,7 +1742,9 @@ class RealWorkflowNode:
                     str(parsed.get("original_text", "")),
                 )
                 if any(
-                    selected_normalized == _normalize_variant_compare(original)
+                    _same_original_identity(
+                        selected_normalized, _normalize_variant_compare(original),
+                    )
                     for original in exhausted_originals
                 ):
                     return {"outcome": "ABANDON_ORIGINAL", "artifact": {
@@ -1703,22 +1798,32 @@ class RealWorkflowNode:
                             valid.append({"variant_text": chunk, "source_id": source.get("source_id"),
                                           "source_url": source.get("url"), "evidence_quote": chunk,
                                           "shared_anchor": matched_anchor})
-                dedup: dict[tuple[str, str], dict[str, Any]] = {}
+                dedup: list[dict[str, Any]] = []
                 for variant in valid:
-                    dedup.setdefault((
-                        _normalize_variant_compare(str(variant.get("variant_text", ""))),
-                        str(variant.get("source_url", "")),
-                    ), variant)
+                    normalized_text = _normalize_variant_compare(
+                        str(variant.get("variant_text", "")),
+                    )
+                    source_url = str(variant.get("source_url", ""))
+                    if not any(
+                        source_url == str(existing.get("source_url", ""))
+                        and _same_original_identity(
+                            normalized_text,
+                            _normalize_variant_compare(
+                                str(existing.get("variant_text", "")),
+                            ),
+                        )
+                        for existing in dedup
+                    ):
+                        dedup.append(variant)
                 original = selected.get("original_text", "") if isinstance(selected, dict) else ""
                 valid = _filter_verified_variants(
-                    str(original), list(anchors), list(dedup.values()),
+                    str(original), list(anchors), dedup,
                 )
                 parsed["variants"] = valid
                 parsed["is_sufficient"] = (
-                    len({
-                        _normalize_variant_compare(str(v.get("variant_text", "")))
-                        for v in valid
-                    }) >= 3
+                    _unique_identity_count([
+                        str(v.get("variant_text", "")) for v in valid
+                    ]) >= 3
                     and len({v.get("source_url") for v in valid if v.get("source_url")}) >= 2
                 )
                 if not parsed["is_sufficient"]:

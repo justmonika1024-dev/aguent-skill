@@ -758,7 +758,7 @@ async def test_auto_discovery_exhausted_original_is_not_selected_again():
 
     assert n02["artifact"]["llm"]["known_example_phrases"] == [alternative]
     assert llm.requests[0].user_payload["excluded_originals"] == [
-        "我猜中了开头,却猜不中这结局",
+        "我猜中了开头却猜不中这结局",
     ]
 
     n05 = await registry.get("N05").execute({
@@ -824,6 +824,56 @@ async def test_auto_repeated_discovery_cycles_stop_before_n05_on_exhausted_evide
         ) == "WAITING_HUMAN_INTERVENTION"
 
     assert len(llm.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_auto_discovery_keeps_new_fragment_from_mixed_exhausted_source():
+    exhausted = "我猜中了开头，却猜不中这结局"
+    alternative = "大胆妖孽，我一眼就看出你不是人"
+    context = RunContext(
+        mode=RunMode.AUTO_DISCOVERY,
+        admission_mode=AdmissionMode.AUTO,
+        strategy_snapshot={"search": {}},
+        exhausted_originals=[exhausted],
+    )
+    services = {"strategy_snapshot": context.strategy_snapshot}
+    source = SearchResult(
+        url="https://forum.example/mixed",
+        canonical_url="https://forum.example/mixed",
+        title=exhausted,
+        text=f"原帖写道：{exhausted}。\n网友还说：{alternative}。",
+    )
+    search = FakeSearchProvider(batches=[SearchBatch(results=[source])])
+    llm = FakeLLMProvider(responses=[{
+        "title": "新梗候选",
+        "original_text": alternative,
+        "fixed_anchors": ["大胆妖孽", "一眼就看出"],
+        "source_id": "O001",
+        "source_url": source.url,
+        "evidence_quote": alternative,
+    }])
+    registry = build_real_registry(llm=llm, search=search)
+
+    n04 = await registry.get("N04").execute({
+        "N03": {"queries": [{
+            "query_id": "OQ1", "query": exhausted, "search_type": "keyword",
+        }]},
+    }, services)
+
+    assert n04["outcome"] == "RESULTS_FOUND"
+    assert len(n04["artifact"]["sources"]) == 1
+    filtered_source = n04["artifact"]["sources"][0]
+    assert exhausted not in filtered_source["title"]
+    assert exhausted not in filtered_source["text"]
+    assert alternative in filtered_source["text"]
+
+    n05 = await registry.get("N05").execute({
+        "N04": {"sources": n04["artifact"]["sources"]},
+    }, services)
+
+    assert n05["outcome"] == "SELECTED"
+    assert n05["artifact"]["llm"]["original_text"] == alternative
+    assert len(llm.requests) == 1
 
 
 @pytest.mark.asyncio
@@ -965,6 +1015,21 @@ def test_substantive_variant_filter_rejects_unmapped_traditional_reprint():
         "這個網絡熱門話題總是讓人意想不到",
         ["网络热门话题", "让人意想不到"],
     ) is False
+
+
+@pytest.mark.parametrize(("candidate", "expected"), [
+    ("設計一個自動觸發彈窗", False),
+    ("帖子里写道，設計一個自動觸發彈窗，围观的人都笑了", False),
+    ("设计一个手动关闭agu窗口", True),
+])
+def test_substantive_variant_filter_rejects_near_glyph_reprints(
+    candidate, expected,
+):
+    assert real_registry.is_substantive_variant(
+        "设计一个自动触发弹窗",
+        candidate,
+        ["设计一个", "弹窗"],
+    ) is expected
 
 
 @pytest.mark.parametrize(("candidate", "expected"), [
@@ -1757,9 +1822,9 @@ async def test_n09_and_n11_share_two_variant_search_retries_per_original():
         "threshold": 2,
         "reason": "N09_INSUFFICIENT_VARIANTS",
     }
-    assert context.loop_counters["variant_search:我猜中了开头,却猜不中这结局"] == 2
+    assert context.loop_counters["variant_search:我猜中了开头却猜不中这结局"] == 2
     assert context.snapshot()["loop_counters"] == {
-        "variant_search:我猜中了开头,却猜不中这结局": 2,
+        "variant_search:我猜中了开头却猜不中这结局": 2,
     }
 
 
@@ -1774,7 +1839,7 @@ async def test_exhausted_original_tracking_keeps_other_original_counter_isolated
     )
     context.__dict__["exhausted_originals"] = []
     context.strategy_snapshot.exhausted_originals = context.exhausted_originals
-    context.loop_counters["variant_search:我猜中了开头,却猜不中这结局"] = 2
+    context.loop_counters["variant_search:我猜中了开头却猜不中这结局"] = 2
     services = {"strategy_snapshot": context.strategy_snapshot}
     registry = build_real_registry(llm=FailingLLM(), search=FakeSearchProvider())
 
@@ -1789,13 +1854,13 @@ async def test_exhausted_original_tracking_keeps_other_original_counter_isolated
 
     assert exhausted_result["outcome"] == "ABANDON_ORIGINAL"
     assert different_result["outcome"] == "INSUFFICIENT"
-    assert context.exhausted_originals == ["我猜中了开头,却猜不中这结局"]
+    assert context.exhausted_originals == ["我猜中了开头却猜不中这结局"]
     assert context.loop_counters == {
-        "variant_search:我猜中了开头,却猜不中这结局": 2,
-        "variant_search:大胆妖孽,我一眼就看出你不是人": 1,
+        "variant_search:我猜中了开头却猜不中这结局": 2,
+        "variant_search:大胆妖孽我一眼就看出你不是人": 1,
     }
     assert context.snapshot()["exhausted_originals"] == [
-        "我猜中了开头,却猜不中这结局",
+        "我猜中了开头却猜不中这结局",
     ]
 
 
@@ -1832,6 +1897,41 @@ async def test_variant_retry_counter_uses_one_key_for_traditional_spellings():
         "variant_search:万万没想到事情竟然会变成这样": 2,
     }
     assert context.exhausted_originals == [simplified]
+
+
+@pytest.mark.asyncio
+async def test_variant_retry_counter_ignores_punctuation_and_whitespace():
+    original = "设计一个自动触发弹窗"
+    punctuated = "设计一个，自动触发弹窗"
+    spaced = "设计一个 自动触发 弹窗"
+    context = RunContext(
+        mode=RunMode.AUTO_DISCOVERY,
+        admission_mode=AdmissionMode.AUTO,
+        strategy_snapshot={"search": {}},
+    )
+    services = {"strategy_snapshot": context.strategy_snapshot}
+    registry = build_real_registry(llm=FailingLLM(), search=FakeSearchProvider())
+
+    first = await registry.get("N09").execute({
+        "N05": {"original_text": original, "fixed_anchors": ["设计一个"]},
+        "N08": {"sources": []},
+    }, services)
+    second = await registry.get("N09").execute({
+        "N05": {"original_text": punctuated, "fixed_anchors": ["设计一个"]},
+        "N08": {"sources": []},
+    }, services)
+    exhausted = await registry.get("N09").execute({
+        "N05": {"original_text": spaced, "fixed_anchors": ["设计一个"]},
+        "N08": {"sources": []},
+    }, services)
+
+    assert first["artifact"]["fallback"]["count"] == 1
+    assert second["artifact"]["fallback"]["count"] == 2
+    assert exhausted["outcome"] == "ABANDON_ORIGINAL"
+    assert context.loop_counters == {
+        "variant_search:设计一个自动触发弹窗": 2,
+    }
+    assert context.exhausted_originals == [original]
 
 
 @pytest.mark.asyncio
