@@ -7,7 +7,7 @@ from sqlalchemy import select
 from app.db.models import RunNodeExecution
 from app.db.persistence import SQLiteRepository
 from app.main import app
-from app.workflow.context import AdmissionMode, RunMode, RunState
+from app.workflow.context import AdmissionMode, RunContext, RunMode, RunState
 from app.workflow.engine import WorkflowConflict, WorkflowEngine
 from app.workflow.events import Command, EventBus
 from app.workflow.registry import NodeRegistry
@@ -80,6 +80,36 @@ def test_variant_search_limit_routes_auto_and_manual_differently(mode, expected)
     assert TransitionTable().next(
         "N09", "ABANDON_ORIGINAL", mode=mode.value,
     ) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("node_key", ["N09", "N11"])
+async def test_node_completed_sse_event_includes_fallback_audit_fields(node_key):
+    context = RunContext(
+        mode=RunMode.AUTO_DISCOVERY,
+        admission_mode=AdmissionMode.AUTO,
+    )
+    engine = WorkflowEngine()
+    engine.contexts[context.run_id] = context
+    engine.buses[context.run_id] = EventBus()
+    context.active_artifacts[node_key] = {
+        "fallback": {
+            "count": 2,
+            "threshold": 2,
+            "reason": f"{node_key}_MORE_VARIANT_EVIDENCE",
+        },
+    }
+
+    await engine._emit(context, "node.completed", {
+        "node_key": node_key,
+        "outcome": "ABANDON_ORIGINAL",
+    })
+
+    event = engine.events(context.run_id)[0][-1]
+    assert event.payload["count"] == 2
+    assert event.payload["threshold"] == 2
+    assert event.payload["reason"] == f"{node_key}_MORE_VARIANT_EVIDENCE"
+    assert '"count": 2' in event.sse()
 
 
 @pytest.mark.asyncio

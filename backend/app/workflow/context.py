@@ -43,12 +43,38 @@ def utcnow() -> datetime:
     return datetime.now(UTC)
 
 
+class _AuditEventBuffer(list[Any]):
+    """Enrich buffered completion events from their persisted node artifact."""
+
+    def __init__(self, owner: RunContext, values: list[Any]) -> None:
+        super().__init__(values)
+        self.owner = owner
+
+    def append(self, event: Any) -> None:
+        if getattr(event, "type", None) == "node.completed":
+            payload = getattr(event, "payload", None)
+            node_key = payload.get("node_key") if isinstance(payload, dict) else None
+            artifact = self.owner.active_artifacts.get(node_key, {})
+            fallback = artifact.get("fallback") if isinstance(artifact, dict) else None
+            if isinstance(payload, dict) and isinstance(fallback, dict):
+                for field_name in ("count", "threshold", "reason"):
+                    if field_name in fallback:
+                        payload[field_name] = fallback[field_name]
+        super().append(event)
+
+
 class RuntimeStrategySnapshot(dict[str, Any]):
     """Strategy data plus run-local state that must not enter persisted JSON."""
 
-    def __init__(self, value: dict[str, Any], loop_counters: dict[str, int]) -> None:
+    def __init__(
+        self,
+        value: dict[str, Any],
+        loop_counters: dict[str, int],
+        exhausted_originals: list[str],
+    ) -> None:
         super().__init__(value)
         self.loop_counters = loop_counters
+        self.exhausted_originals = exhausted_originals
 
     def __deepcopy__(self, memo: dict[int, Any]) -> dict[str, Any]:
         return deepcopy(dict(self), memo)
@@ -71,6 +97,7 @@ class RunContext:
     strategy_version_id: str | None = None
     strategy_snapshot: dict[str, Any] = field(default_factory=dict)
     loop_counters: dict[str, int] = field(default_factory=dict)
+    exhausted_originals: list[str] = field(default_factory=list)
     pause_requested: bool = False
     terminate_requested: bool = False
     retry_available: bool = False
@@ -82,14 +109,18 @@ class RunContext:
 
     def __post_init__(self) -> None:
         self.strategy_snapshot = RuntimeStrategySnapshot(
-            self.strategy_snapshot, self.loop_counters,
+            self.strategy_snapshot, self.loop_counters, self.exhausted_originals,
         )
+        self.event_buffer = _AuditEventBuffer(self, self.event_buffer)
 
     def __setattr__(self, name: str, value: Any) -> None:
         if (name == "strategy_snapshot" and isinstance(value, dict)
                 and not isinstance(value, RuntimeStrategySnapshot)
-                and "loop_counters" in self.__dict__):
-            value = RuntimeStrategySnapshot(value, self.loop_counters)
+                and "loop_counters" in self.__dict__
+                and "exhausted_originals" in self.__dict__):
+            value = RuntimeStrategySnapshot(
+                value, self.loop_counters, self.exhausted_originals,
+            )
         super().__setattr__(name, value)
 
     @property
@@ -110,6 +141,7 @@ class RunContext:
             "strategy_version_id": self.strategy_version_id,
             "strategy_snapshot": deepcopy(self.strategy_snapshot),
             "loop_counters": deepcopy(self.loop_counters),
+            "exhausted_originals": deepcopy(self.exhausted_originals),
             "retry_available": self.retry_available,
         }
 

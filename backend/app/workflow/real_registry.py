@@ -478,10 +478,9 @@ def _variant_search_plan(
             "strategy_origin": "STRATEGY_PREFER_UGC",
         })
     for directive in directives[:2]:
-        query_hint = directive[:48]
         plan.append({
             "query_id": f"VQ{len(plan) + 1}",
-            "query": f'"{primary}" {query_hint}',
+            "query": f'"{primary}" {directive}',
             "search_type": "auto",
             "purpose": "执行人工反馈指令并寻找槽位替换",
             "strategy_origin": "FEEDBACK_DIRECTIVE",
@@ -511,10 +510,20 @@ _COMMON_TRADITIONAL_TO_SIMPLIFIED = str.maketrans({
     "為": "为", "說": "说", "對": "对", "發": "发", "現": "现",
     "實": "实", "體": "体", "來": "来", "時": "时", "個": "个",
     "們": "们", "與": "与", "後": "后", "裡": "里", "從": "从",
+    "熱": "热", "門": "门", "話": "话", "題": "题", "總": "总",
+    "讓": "让", "覺": "觉", "興": "兴", "編": "编", "寫": "写",
+    "學": "学", "經": "经", "過": "过", "還": "还", "樣": "样",
+    "嗎": "吗", "無": "无", "關": "关", "點": "点", "應": "应",
+    "機": "机", "會": "会", "進": "进", "長": "长", "間": "间",
+    "問": "问", "頁": "页", "區": "区", "國": "国", "愛": "爱",
+    "傳": "传", "統": "统", "變": "变", "種": "种", "書": "书",
+    "圖": "图", "簡": "简", "轉": "转", "換": "换", "純": "纯",
+    "異": "异", "廣": "广", "東": "东", "臺": "台", "灣": "湾",
 })
 _VARIANT_WRAPPER = re.compile(
     r"(?:是什么意思|什么意思|意思是|含义|释义|赏析|解析|解读|出处|"
-    r"原句(?:是|：|:)?|句子赏析|标题|台词|这句话|这句|网络流行(?:语|词))",
+    r"原句(?:是|：|:)?|句子赏析|标题|台词|这句话|这句|网络流行(?:语|词)|"
+    r"(?:网友|有人)(?:改成了|改写成|改编成)|笑死)",
     re.IGNORECASE,
 )
 
@@ -712,6 +721,37 @@ def _filter_verified_variants(
 _MAX_VARIANT_SEARCH_RETRIES = 2
 
 
+def _runtime_exhausted_originals(services: Any) -> list[str]:
+    strategy_snapshot = (
+        services.get("strategy_snapshot") if isinstance(services, dict) else None
+    )
+    values = getattr(strategy_snapshot, "exhausted_originals", None)
+    if values is None and isinstance(strategy_snapshot, dict):
+        values = strategy_snapshot.get("exhausted_originals")
+    if not isinstance(values, list):
+        return []
+    return list(dict.fromkeys(
+        str(value).strip() for value in values
+        if isinstance(value, str) and value.strip()
+    ))
+
+
+def _remove_exhausted_originals(
+    parsed: dict[str, Any], exhausted_originals: list[str],
+) -> None:
+    excluded = {
+        _normalize_variant_compare(original) for original in exhausted_originals
+    }
+    for field_name in ("known_example_phrases", "possible_original_phrases"):
+        values = parsed.get(field_name)
+        if isinstance(values, list):
+            parsed[field_name] = [
+                value for value in values
+                if not isinstance(value, str)
+                or _normalize_variant_compare(value) not in excluded
+            ]
+
+
 def _bounded_variant_fallback(
     services: Any,
     original: str,
@@ -728,6 +768,12 @@ def _bounded_variant_fallback(
     if current >= _MAX_VARIANT_SEARCH_RETRIES:
         outcome = "ABANDON_ORIGINAL"
         count = current
+        exhausted_originals = getattr(
+            strategy_snapshot, "exhausted_originals", None,
+        )
+        if (isinstance(exhausted_originals, list) and original
+                and original not in exhausted_originals):
+            exhausted_originals.append(original)
     else:
         count = current + 1
         if isinstance(counters, dict):
@@ -937,10 +983,18 @@ class RealWorkflowNode:
             parsed = {"queries": _variant_search_plan(
                 original, anchors, search_strategy, directives,
             )}
+            applied_directives = [
+                directive for directive in directives
+                if any(
+                    query.get("strategy_origin") == "FEEDBACK_DIRECTIVE"
+                    and directive in str(query.get("query", ""))
+                    for query in parsed["queries"]
+                )
+            ]
             return {"outcome": self.outcome, "artifact": {
                 "llm": parsed,
                 "planning_mode": "STRATEGY_GUIDED",
-                "applied_directives": directives,
+                "applied_directives": applied_directives,
                 "strategy_version_id": services.get("strategy_version_id")
                 if isinstance(services, dict) else None,
             }}
@@ -1270,6 +1324,11 @@ class RealWorkflowNode:
                 "all_slots_semantic_relation_weight": 0,
                 "do_not_reward_explaining_every_slot": True,
             }
+        exhausted_originals = (
+            _runtime_exhausted_originals(services) if self.key == "N02" else []
+        )
+        if self.key == "N02":
+            payload["excluded_originals"] = exhausted_originals
         if self.key == "N02" and self.repository and hasattr(
             self.repository, "list_formal_meme_titles"
         ):
@@ -1394,6 +1453,8 @@ class RealWorkflowNode:
                     {"query_id": "OQ2", "query": base + " 什么梗", "search_type": "auto", "purpose": "找梗百科"},
                     {"query_id": "OQ3", "query": base + " 网友改编", "search_type": "auto", "purpose": "验证可改编性"},
                 ]
+            if self.key == "N02":
+                _remove_exhausted_originals(parsed, exhausted_originals)
             if self.key == "N02" and not _concrete_phrases(parsed):
                 correction = NodeLLMRequest(
                     node_key="N02",
@@ -1401,7 +1462,11 @@ class RealWorkflowNode:
                         " 上一次没有返回可搜索原句。必须返回known_example_phrases数组，"
                         "包含3到5个彼此独立、逐字可搜索的中文完整梗句，禁止空数组和泛化主题。"
                     ),
-                    user_payload={"artifacts": compact, "invalid_previous_output": parsed},
+                    user_payload={
+                        "artifacts": compact,
+                        "invalid_previous_output": parsed,
+                        "excluded_originals": exhausted_originals,
+                    },
                     output_schema=request.output_schema,
                     schema_name=request.schema_name,
                     parameter_profile=request.parameter_profile,
@@ -1419,6 +1484,7 @@ class RealWorkflowNode:
                             latency_ms=retry_result.latency_ms, node_key=self.key,
                         )
                     parsed = retry_result.parsed_json
+                    _remove_exhausted_originals(parsed, exhausted_originals)
                     if _concrete_phrases(parsed):
                         break
             if self.key == "N02":
@@ -1473,6 +1539,18 @@ class RealWorkflowNode:
                 parsed["original_text"] = _core_phrase_from_evidence(
                     str(parsed.get("original_text", "")), references,
                 )
+                exhausted_originals = _runtime_exhausted_originals(services)
+                selected_normalized = _normalize_variant_compare(
+                    str(parsed.get("original_text", "")),
+                )
+                if any(
+                    selected_normalized == _normalize_variant_compare(original)
+                    for original in exhausted_originals
+                ):
+                    return {"outcome": "ABANDON_ORIGINAL", "artifact": {
+                        "rejected_original": parsed.get("original_text", ""),
+                        "rejection_reason": "EXHAUSTED_ORIGINAL_RESELECTED",
+                    }}
                 if _is_definition_or_explanation(str(parsed.get("original_text", ""))):
                     raise ValueError("N05 cannot select a definition or explanatory sentence as an original meme")
                 parsed.setdefault("source_url", source.get("url"))
@@ -1495,11 +1573,9 @@ class RealWorkflowNode:
                     source = by_id.get(variant.get("source_id"))
                     quote = str(variant.get("evidence_quote", ""))
                     variant_text = str(variant.get("variant_text", ""))
-                    haystack = (
-                        str(source.get("title", "")) + "\n" + str(source.get("text", ""))
-                        if source else ""
-                    )
-                    if source and quote and variant_text and quote in haystack and variant_text in haystack:
+                    body = str(source.get("text", "")) if source else ""
+                    if (source and quote and variant_text
+                            and quote in body and variant_text in quote):
                         item = dict(variant)
                         item["source_url"] = source.get("url", "")
                         valid.append(item)

@@ -11,6 +11,7 @@ from app.workflow.real_registry import (
     build_real_registry,
     derive_required_patch_operations,
 )
+from app.workflow.transitions import TransitionTable
 
 
 class FailingLLM:
@@ -717,6 +718,60 @@ async def test_auto_discovery_retries_empty_candidate_list_before_failing_run():
 
 
 @pytest.mark.asyncio
+async def test_auto_discovery_exhausted_original_is_not_selected_again():
+    exhausted = "我猜中了开头，却猜不中这结局"
+    alternative = "大胆妖孽，我一眼就看出你不是人"
+    source = {
+        "source_id": "O001",
+        "url": "https://forum.example/original",
+        "title": "原梗转载",
+        "text": exhausted,
+    }
+    context = RunContext(
+        mode=RunMode.AUTO_DISCOVERY,
+        admission_mode=AdmissionMode.AUTO,
+        strategy_snapshot={"search": {}},
+    )
+    context.__dict__["exhausted_originals"] = [exhausted]
+    context.strategy_snapshot.exhausted_originals = context.exhausted_originals
+    services = {"strategy_snapshot": context.strategy_snapshot}
+    llm = FakeLLMProvider(responses=[
+        {
+            "discovery_hypothesis": "重新寻找可改编原梗",
+            "keywords": ["中文梗", "台词梗"],
+            "known_example_phrases": [exhausted, alternative],
+        },
+        {
+            "title": source["title"],
+            "original_text": exhausted,
+            "fixed_anchors": ["我猜中了", "却猜不中"],
+            "source_id": source["source_id"],
+            "source_url": source["url"],
+            "evidence_quote": exhausted,
+        },
+    ])
+    registry = build_real_registry(llm=llm, search=FakeSearchProvider())
+
+    n02 = await registry.get("N02").execute(
+        {"START": {"mode": "AUTO_DISCOVERY"}}, services,
+    )
+
+    assert n02["artifact"]["llm"]["known_example_phrases"] == [alternative]
+    assert llm.requests[0].user_payload["excluded_originals"] == [exhausted]
+
+    n05 = await registry.get("N05").execute({
+        "N02": n02["artifact"],
+        "N04": {"sources": [source]},
+    }, services)
+
+    assert n05["outcome"] == "ABANDON_ORIGINAL"
+    assert n05["artifact"]["rejection_reason"] == "EXHAUSTED_ORIGINAL_RESELECTED"
+    assert TransitionTable().next(
+        "N05", n05["outcome"], mode=RunMode.AUTO_DISCOVERY.value,
+    ) == "N02"
+
+
+@pytest.mark.asyncio
 async def test_auto_discovery_prompt_includes_only_formal_meme_titles():
     repository = FormalMemeRepositoryStub()
     llm = FakeLLMProvider(responses=[{
@@ -838,6 +893,7 @@ async def test_n07_builds_variant_queries_from_selected_original_without_llm_dep
     ("我猜中了开头，却猜不中这结局是什么意思", False),
     ("句子赏析：我猜中了开头，却猜不中这结局", False),
     ("我猜中了开头，却猜不中agu被谁凿了", True),
+    ("网友改成了我猜中了开头，却猜不中agu被谁凿了，笑死", False),
     ("今天看到一句话，我猜中了开头，却猜不中这结局，真的很有感触", False),
 ])
 def test_substantive_variant_filter(candidate, expected):
@@ -846,6 +902,14 @@ def test_substantive_variant_filter(candidate, expected):
         candidate,
         ["我猜中了", "却猜不中"],
     ) is expected
+
+
+def test_substantive_variant_filter_rejects_unmapped_traditional_reprint():
+    assert real_registry.is_substantive_variant(
+        "这个网络热门话题总是让人意想不到",
+        "這個網絡熱門話題總是讓人意想不到",
+        ["网络热门话题", "让人意想不到"],
+    ) is False
 
 
 @pytest.mark.asyncio
@@ -880,6 +944,62 @@ async def test_n07_strategy_query_uses_feedback_and_ugc_preference():
     assert any("论坛" in item["query"] for item in queries)
     assert all(item["strategy_origin"] for item in queries)
     assert llm.requests == []
+
+
+@pytest.mark.asyncio
+async def test_n07_applied_directives_only_lists_queries_that_consumed_them():
+    directives = [
+        "优先搜索论坛里的真实改写",
+        "排除百科页面和原句转载",
+        "补充微博评论区里的槽位替换",
+    ]
+    registry = build_real_registry(
+        llm=FakeLLMProvider(), search=FakeSearchProvider(),
+    )
+
+    result = await registry.get("N07").execute({
+        "N05": {
+            "original_text": "我猜中了开头，却猜不中这结局",
+            "fixed_anchors": ["我猜中了", "却猜不中"],
+        },
+    }, {
+        "strategy_snapshot": {"search": {
+            "prefer_ugc_sources": True,
+            "variant_query_directives": directives,
+        }},
+    })
+
+    artifact = result["artifact"]
+    queries = artifact["llm"]["queries"]
+    assert artifact["applied_directives"] == directives[:2]
+    assert all(
+        any(directive in item["query"] for item in queries)
+        for directive in artifact["applied_directives"]
+    )
+    assert all(directives[2] not in item["query"] for item in queries)
+
+
+@pytest.mark.asyncio
+async def test_n07_claimed_long_directive_is_not_truncated_in_query():
+    directive = "优先搜索论坛帖子和微博评论区中由真实网友发布的完整槽位替换文本，并排除百科释义、营销聚合页与原句转载"
+    registry = build_real_registry(
+        llm=FakeLLMProvider(), search=FakeSearchProvider(),
+    )
+
+    result = await registry.get("N07").execute({
+        "N05": {
+            "original_text": "我猜中了开头，却猜不中这结局",
+            "fixed_anchors": ["我猜中了", "却猜不中"],
+        },
+    }, {
+        "strategy_snapshot": {"search": {
+            "variant_query_directives": [directive],
+        }},
+    })
+
+    artifact = result["artifact"]
+    assert artifact["applied_directives"] == [directive]
+    assert any(directive in item["query"] for item in artifact["llm"]["queries"])
 
 
 @pytest.mark.asyncio
@@ -1401,6 +1521,90 @@ async def test_n09_strict_fallback_returns_insufficient_for_reprints_and_explana
 
 
 @pytest.mark.asyncio
+async def test_n09_mixed_traditional_reprints_cannot_reach_sufficient():
+    original = "这个网络热门话题总是让人意想不到"
+    reprints = [
+        "這個網絡熱門話題總是讓人意想不到",
+        "這個網絡热門話題總是讓人意想不到",
+        "這個網絡熱門话題總是讓人意想不到",
+    ]
+    sources = [
+        {
+            "source_id": f"V{i}",
+            "url": f"https://forum.example/{i}",
+            "title": f"转载{i}",
+            "text": reprint,
+        }
+        for i, reprint in enumerate(reprints, 1)
+    ]
+    registry = build_real_registry(llm=FakeLLMProvider(responses=[{
+        "variants": [
+            {
+                "variant_text": reprint,
+                "source_id": f"V{i}",
+                "source_url": f"https://forum.example/{i}",
+                "evidence_quote": reprint,
+                "shared_anchor": "网络热门话题",
+            }
+            for i, reprint in enumerate(reprints, 1)
+        ],
+    }]), search=FakeSearchProvider())
+
+    result = await registry.get("N09").execute({
+        "N05": {
+            "original_text": original,
+            "fixed_anchors": ["网络热门话题", "让人意想不到"],
+        },
+        "N08": {"sources": sources},
+    }, None)
+
+    assert result["outcome"] == "INSUFFICIENT"
+    assert result["artifact"]["llm"]["variants"] == []
+
+
+@pytest.mark.asyncio
+async def test_n09_rejects_title_body_split_evidence():
+    original = "我猜中了开头，却猜不中这结局"
+    variants = [
+        "我猜中了开头，却猜不中agu被谁凿了",
+        "我猜中了开头，却猜不中是谁先动的手",
+        "我猜中了开头，却猜不中群友最后凿了谁",
+    ]
+    sources = [
+        {
+            "source_id": f"V{i}",
+            "url": f"https://forum.example/{i}",
+            "title": variant,
+            "text": f"正文只写了无关摘要{i}",
+        }
+        for i, variant in enumerate(variants, 1)
+    ]
+    registry = build_real_registry(llm=FakeLLMProvider(responses=[{
+        "variants": [
+            {
+                "variant_text": variant,
+                "source_id": f"V{i}",
+                "source_url": f"https://forum.example/{i}",
+                "evidence_quote": f"正文只写了无关摘要{i}",
+                "shared_anchor": "我猜中了",
+            }
+            for i, variant in enumerate(variants, 1)
+        ],
+    }]), search=FakeSearchProvider())
+
+    result = await registry.get("N09").execute({
+        "N05": {
+            "original_text": original,
+            "fixed_anchors": ["我猜中了", "却猜不中"],
+        },
+        "N08": {"sources": sources},
+    }, None)
+
+    assert result["outcome"] == "INSUFFICIENT"
+    assert result["artifact"]["llm"]["variants"] == []
+
+
+@pytest.mark.asyncio
 async def test_n09_limits_structured_extraction_to_eight_sources_and_variants():
     original = "我猜中了开头，却猜不中这结局"
     variants = [
@@ -1477,6 +1681,40 @@ async def test_n09_and_n11_share_two_variant_search_retries_per_original():
     }
     assert context.loop_counters[f"variant_search:{original}"] == 2
     assert context.snapshot()["loop_counters"] == {f"variant_search:{original}": 2}
+
+
+@pytest.mark.asyncio
+async def test_exhausted_original_tracking_keeps_other_original_counter_isolated():
+    exhausted = "我猜中了开头，却猜不中这结局"
+    different = "大胆妖孽，我一眼就看出你不是人"
+    context = RunContext(
+        mode=RunMode.AUTO_DISCOVERY,
+        admission_mode=AdmissionMode.AUTO,
+        strategy_snapshot={"search": {}},
+    )
+    context.__dict__["exhausted_originals"] = []
+    context.strategy_snapshot.exhausted_originals = context.exhausted_originals
+    context.loop_counters[f"variant_search:{exhausted}"] = 2
+    services = {"strategy_snapshot": context.strategy_snapshot}
+    registry = build_real_registry(llm=FailingLLM(), search=FakeSearchProvider())
+
+    exhausted_result = await registry.get("N09").execute({
+        "N05": {"original_text": exhausted, "fixed_anchors": ["我猜中了", "却猜不中"]},
+        "N08": {"sources": []},
+    }, services)
+    different_result = await registry.get("N09").execute({
+        "N05": {"original_text": different, "fixed_anchors": ["大胆妖孽", "一眼就看出"]},
+        "N08": {"sources": []},
+    }, services)
+
+    assert exhausted_result["outcome"] == "ABANDON_ORIGINAL"
+    assert different_result["outcome"] == "INSUFFICIENT"
+    assert context.exhausted_originals == [exhausted]
+    assert context.loop_counters == {
+        f"variant_search:{exhausted}": 2,
+        f"variant_search:{different}": 1,
+    }
+    assert context.snapshot()["exhausted_originals"] == [exhausted]
 
 
 @pytest.mark.asyncio
