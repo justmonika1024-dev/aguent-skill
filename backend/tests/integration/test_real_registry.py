@@ -1882,6 +1882,10 @@ async def test_n13_rejects_coordinated_other_recipient_without_blocking_new_pred
         "C4": "他凿agu，然后回家",
         "C5": "agu被他们凿了",
         "C6": "凿agu的结果很明显",
+        "C7": "他凿agu和朋友聊天",
+        "C8": "他凿agu，回家",
+        "C9": "他凿agu和朋友",
+        "C10": "他凿agu和小王聊天",
     }
     high_score = {
         "fluency": 10,
@@ -1908,12 +1912,14 @@ async def test_n13_rejects_coordinated_other_recipient_without_blocking_new_pred
     payload = result["artifact"]["llm"]
     scores = {score["candidate_id"]: score for score in payload["scores"]}
     assert result["outcome"] == "HAS_QUALIFIED"
-    assert payload["qualified_candidate_ids"] == ["C3", "C4", "C5", "C6"]
-    for candidate_id in ("C1", "C2"):
+    assert payload["qualified_candidate_ids"] == [
+        "C3", "C4", "C5", "C6", "C7", "C8", "C10",
+    ]
+    for candidate_id in ("C1", "C2", "C9"):
         assert scores[candidate_id]["agu_fit"] < 6
         assert scores[candidate_id]["qualified"] is False
         assert "其他动作受事" in "".join(scores[candidate_id]["problems"])
-    for candidate_id in ("C3", "C4", "C5", "C6"):
+    for candidate_id in ("C3", "C4", "C5", "C6", "C7", "C8", "C10"):
         assert scores[candidate_id]["agu_fit"] == 10
         assert scores[candidate_id]["qualified"] is True
         assert not scores[candidate_id]["problems"]
