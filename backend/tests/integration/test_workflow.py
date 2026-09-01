@@ -6,7 +6,7 @@ from httpx import ASGITransport, AsyncClient
 from app.main import app
 from app.workflow.context import AdmissionMode, RunMode, RunState
 from app.workflow.engine import WorkflowConflict, WorkflowEngine
-from app.workflow.events import Command
+from app.workflow.events import Command, EventBus
 from app.workflow.registry import NodeRegistry
 
 
@@ -48,6 +48,62 @@ async def test_second_active_run_and_stale_version_are_rejected():
         await engine.start_run(mode=RunMode.AUTO_DISCOVERY, admission_mode=AdmissionMode.AUTO)
     with pytest.raises(WorkflowConflict):
         await engine.command(ctx.run_id, Command("PAUSE", expected_run_version=999))
+
+
+def failed_context(node_key: str = "N20"):
+    from app.workflow.context import RunContext
+
+    context = RunContext(mode=RunMode.MANUAL_SEED, admission_mode=AdmissionMode.HUMAN)
+    context.current_node = node_key
+    context.current_state = RunState.FAILED
+    context.retry_available = True
+    return context
+
+
+@pytest.mark.asyncio
+async def test_concurrent_retry_commands_start_only_one_workflow():
+    context = failed_context()
+    engine = WorkflowEngine(NodeRegistry({"N20": FakeNode("N20", "COMPLETED")}))
+    engine.contexts[context.run_id] = context
+    engine.buses[context.run_id] = EventBus()
+    prior_can_finish = asyncio.Event()
+
+    async def finishing_failed_attempt():
+        await prior_can_finish.wait()
+
+    engine._tasks[context.run_id] = asyncio.create_task(finishing_failed_attempt())
+
+    retry_tasks = [
+        asyncio.create_task(engine.command(context.run_id, Command(
+            "RETRY_NODE", expected_run_version=0, payload={"node_key": "N20"},
+        ))),
+        asyncio.create_task(engine.command(context.run_id, Command(
+            "RETRY_NODE", expected_run_version=0, payload={"node_key": "N20"},
+        ))),
+    ]
+    await asyncio.sleep(0)
+    prior_can_finish.set()
+    results = await asyncio.gather(*retry_tasks, return_exceptions=True)
+
+    assert sum(isinstance(result, dict) and result.get("accepted") is True for result in results) == 1
+    assert sum(isinstance(result, WorkflowConflict) for result in results) == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_run_cannot_retry_while_another_run_is_active():
+    failed = failed_context()
+    active = failed_context("N12")
+    active.current_state = RunState.RUNNING
+    active.retry_available = False
+    engine = WorkflowEngine(NodeRegistry({"N20": FakeNode("N20", "COMPLETED")}))
+    for context in (failed, active):
+        engine.contexts[context.run_id] = context
+        engine.buses[context.run_id] = EventBus()
+
+    with pytest.raises(WorkflowConflict, match="ACTIVE_RUN_EXISTS"):
+        await engine.command(failed.run_id, Command(
+            "RETRY_NODE", expected_run_version=0, payload={"node_key": "N20"},
+        ))
 
 
 @pytest.mark.asyncio

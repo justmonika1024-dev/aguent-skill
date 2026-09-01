@@ -48,8 +48,12 @@ class WorkflowEngine:
             mode, admission_mode = RunMode(mode), AdmissionMode(admission_mode)
             if continuous_enabled and mode is not RunMode.AUTO_DISCOVERY:
                 raise ValueError("continuous execution is only allowed for AUTO_DISCOVERY")
+            strategy_version_id = None
+            if self.repository:
+                strategy_version_id, strategy_snapshot = await self.repository.ensure_active_strategy()
             context = RunContext(mode=mode, admission_mode=admission_mode, seed_text=seed_text,
                                  continuous_enabled=continuous_enabled,
+                                 strategy_version_id=strategy_version_id,
                                  strategy_snapshot=strategy_snapshot or {})
             context.branches[context.active_branch_id] = {"parent_branch_id": None, "origin": "ROOT"}
             self.contexts[context.run_id] = context
@@ -63,6 +67,10 @@ class WorkflowEngine:
             return context
 
     async def command(self, run_id: str, command: Command) -> Any:
+        async with self._lock:
+            return await self._command_locked(run_id, command)
+
+    async def _command_locked(self, run_id: str, command: Command) -> Any:
         context = self.contexts.get(run_id)
         if context is None:
             raise KeyError(run_id)
@@ -71,6 +79,7 @@ class WorkflowEngine:
             return cached
         if command.expected_run_version is not None and command.expected_run_version != context.run_version:
             raise WorkflowConflict("RUN_VERSION_CONFLICT")
+        restart_failed_node = False
         if command.type == "PAUSE":
             context.pause_requested = True
             context.current_state = RunState.PAUSING
@@ -101,13 +110,38 @@ class WorkflowEngine:
             context.current_node = command.payload.get("node_key", context.current_node)
             context.current_state = RunState.RUNNING
         elif command.type == "RETRY_NODE":
+            if context.current_state is not RunState.FAILED or not context.retry_available:
+                raise WorkflowConflict("RETRY_NOT_AVAILABLE")
+            retry_node = str(command.payload.get("node_key", context.current_node))
+            if retry_node != context.current_node:
+                raise ValueError("retry node must be the failed current node")
+            other_active = next((
+                candidate for candidate_id, candidate in self.contexts.items()
+                if candidate_id != run_id and candidate.current_state not in {
+                    RunState.COMPLETED, RunState.FAILED, RunState.TERMINATED,
+                }
+            ), None)
+            if other_active is not None:
+                raise WorkflowConflict("ACTIVE_RUN_EXISTS")
+            previous_task = self._tasks.get(run_id)
+            if previous_task is not None and not previous_task.done():
+                await asyncio.shield(previous_task)
             context.current_state = RunState.RUNNING
+            context.ended_at = None
+            context.retry_available = False
+            restart_failed_node = True
+            if self.repository:
+                await self.repository.mark_run_retried(context)
         else:
             raise ValueError(f"unsupported command: {command.type}")
         context.run_version += 1
         result = {"command_id": command.command_id, "accepted": True, "run_version": context.run_version}
         self._command_results[(run_id, command.command_id)] = result
         await self._emit(context, "command.accepted", {"command_type": command.type})
+        await self._sync_context(context)
+        if restart_failed_node:
+            task = asyncio.create_task(self._run(context))
+            self._tasks[context.run_id] = task
         return result
 
     async def submit_evaluation(self, run_id: str, evaluation: dict[str, Any], *,
@@ -127,6 +161,7 @@ class WorkflowEngine:
                 if context.terminate_requested:
                     context.current_state, context.ended_at = RunState.TERMINATED, utcnow()
                     await self._emit(context, "run.completed", {"status": "TERMINATED"})
+                    await self._sync_context(context)
                     if self.repository:
                         await self.repository.archive_run(context)
                     if self.repository:
@@ -137,6 +172,7 @@ class WorkflowEngine:
                     context.current_state = RunState.PAUSED
                     context.run_version += 1
                     await self._emit(context, "run.paused", {})
+                    await self._sync_context(context)
                     await asyncio.sleep(0.05)
                     continue
                 if context.current_state in {RunState.PAUSED, RunState.WAITING_HUMAN_INTERVENTION,
@@ -144,8 +180,10 @@ class WorkflowEngine:
                     await asyncio.sleep(0.05)
                     continue
                 context.current_state = RunState.RUNNING
+                await self._sync_context(context)
                 node = context.current_node
                 output: Any
+                attempt_started_at = utcnow()
                 await self._emit(context, "node.started", {"node_key": node})
                 if node == "START":
                     outcome, output = context.mode.value, {"mode": context.mode.value, "seed_text": context.seed_text}
@@ -171,20 +209,51 @@ class WorkflowEngine:
                         # Missing production wiring is an explicit intervention, never success.
                         context.current_state = RunState.WAITING_HUMAN_INTERVENTION
                         await self._emit(context, "node.failed", {"node_key": node, "error": "NODE_NOT_REGISTERED"})
+                        await self._sync_context(context)
                         continue
                     except Exception as exc:
+                        error_code = (
+                            "NODE_TIMEOUT" if isinstance(exc, TimeoutError)
+                            else "NODE_OUTPUT_VALIDATION_FAILED" if isinstance(exc, ValueError)
+                            else "NODE_EXECUTION_FAILED"
+                        )
+                        if self.repository:
+                            await self.repository.persist_node_failure(
+                                context,
+                                node,
+                                error_code=error_code,
+                                error_message=str(exc),
+                                started_at=attempt_started_at,
+                                ended_at=utcnow(),
+                            )
+                        context.retry_available = True
                         context.current_state = RunState.FAILED
-                        await self._emit(context, "node.failed", {"node_key": node, "error": str(exc)})
+                        context.ended_at = utcnow()
+                        await self._emit(context, "node.failed", {
+                            "node_key": node,
+                            "error_code": error_code,
+                            "error": str(exc),
+                            "retry_from_node": node,
+                        })
+                        await self._sync_context(context)
                         if self.repository:
                             await self.repository.archive_run(context)
                         break
                 context.node_outputs[node] = output
                 context.active_artifacts[node] = output
                 if self.repository and node != "START":
-                    await self.repository.persist_node(context, node, output, outcome)
+                    await self.repository.persist_node(
+                        context,
+                        node,
+                        output,
+                        outcome,
+                        started_at=attempt_started_at,
+                        ended_at=utcnow(),
+                    )
                 if self.repository and node == "N18" and isinstance(output, dict):
                     await self.repository.persist_evaluation(context, output)
                 await self._emit(context, "node.completed", {"node_key": node, "outcome": outcome})
+                await self._sync_context(context)
                 if node == "N18" and outcome == "EVALUATION_SUBMITTED":
                     context.current_node = "N19"
                 elif node == "N17" and outcome in {"AUTO_DECIDED", "WAIT_HUMAN_DECISION"}:
@@ -192,6 +261,7 @@ class WorkflowEngine:
                     context.current_state = RunState.WAITING_HUMAN_EVALUATION
                     context.run_version += 1
                     await self._emit(context, "human.required", {"node_key": "N18"})
+                    await self._sync_context(context)
                     continue
                 else:
                     nxt = self.transitions.next(node, str(outcome), mode=context.mode.value,
@@ -199,6 +269,7 @@ class WorkflowEngine:
                     if nxt is None:
                         context.current_state, context.ended_at = RunState.COMPLETED, utcnow()
                         await self._emit(context, "run.completed", {"status": "COMPLETED"})
+                        await self._sync_context(context)
                         if self.repository:
                             await self.repository.archive_run(context)
                         if self.archive_service:
@@ -209,6 +280,7 @@ class WorkflowEngine:
                     context.current_node = nxt
                 context.run_version += 1
                 await self._emit(context, "state.changed", {"current_node": context.current_node})
+                await self._sync_context(context)
         finally:
             self._tasks.pop(context.run_id, None)
 
@@ -221,6 +293,10 @@ class WorkflowEngine:
         context.event_buffer.append(event)
         if len(context.event_buffer) > 1000:
             del context.event_buffer[:-1000]
+
+    async def _sync_context(self, context: RunContext) -> None:
+        if self.repository:
+            await self.repository.sync_run_snapshot(context)
 
     def snapshot(self, run_id: str) -> dict[str, Any]:
         return self.contexts[run_id].snapshot()

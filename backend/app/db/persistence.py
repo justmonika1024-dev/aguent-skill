@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
+from uuid import uuid4
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+from app.services.strategy import StrategyPatch, StrategyService, default_strategy
 
 from .base import Base
 from .models import (
@@ -20,6 +23,9 @@ from .models import (
     RunRecord,
     RunSearchBatch,
     RunSourceEvidence,
+    RunStrategyPatch,
+    RunStrategyState,
+    RunStrategyVersion,
 )
 
 
@@ -50,6 +56,101 @@ class SQLiteRepository:
             await conn.run_sync(Base.metadata.create_all)
         self._initialized = True
 
+    async def ensure_active_strategy(self) -> tuple[str, dict[str, Any]]:
+        await self.init()
+        async with self.session() as s, s.begin():
+            state = await s.get(RunStrategyState, 1)
+            if state is None:
+                version_id = str(uuid4())
+                strategy = default_strategy()
+                now = datetime.now(UTC)
+                s.add(RunStrategyVersion(
+                    id=version_id,
+                    version_number=1,
+                    parent_version_id=None,
+                    strategy_json=strategy,
+                    source_run_id=None,
+                    source_evaluation_id=None,
+                    change_summary="Default strategy",
+                    created_at=now,
+                ))
+                s.add(RunStrategyState(
+                    id=1,
+                    active_strategy_version_id=version_id,
+                    updated_at=now,
+                ))
+                return version_id, strategy
+            version = await s.get(RunStrategyVersion, state.active_strategy_version_id)
+            if version is None:
+                raise RuntimeError("active strategy version does not exist")
+            return version.id, _json(version.strategy_json)
+
+    async def apply_strategy_patch(
+        self,
+        *,
+        source_run_id: str,
+        evaluation_id: str,
+        before_version_id: str,
+        patch: StrategyPatch | dict[str, Any],
+    ) -> tuple[str, dict[str, Any]]:
+        await self.init()
+        async with self.session() as s, s.begin():
+            state = await s.get(RunStrategyState, 1)
+            if state is None or state.active_strategy_version_id != before_version_id:
+                raise ValueError("before strategy version is not active")
+            before = await s.get(RunStrategyVersion, before_version_id)
+            if before is None:
+                raise ValueError("before strategy version does not exist")
+            after = StrategyService().apply(before.strategy_json, patch)
+            next_version = (await s.scalar(select(func.max(RunStrategyVersion.version_number))) or 0) + 1
+            after_version_id = str(uuid4())
+            patch_id = str(uuid4())
+            now = datetime.now(UTC)
+            payload = patch if isinstance(patch, dict) else {
+                "operations": patch.operations,
+                "feedback_summary": patch.feedback_summary,
+                "affected_nodes": patch.affected_nodes or [],
+            }
+            operations = payload.get("patch_operations", payload.get("operations", []))
+            s.add(RunStrategyVersion(
+                id=after_version_id,
+                version_number=next_version,
+                parent_version_id=before_version_id,
+                strategy_json=after,
+                source_run_id=source_run_id,
+                source_evaluation_id=evaluation_id,
+                change_summary=payload.get("feedback_summary", ""),
+                created_at=now,
+            ))
+            s.add(RunStrategyPatch(
+                id=patch_id,
+                source_run_id=source_run_id,
+                evaluation_id=evaluation_id,
+                before_version_id=before_version_id,
+                after_version_id=after_version_id,
+                feedback_summary=payload.get("feedback_summary", ""),
+                affected_nodes_json=_json(payload.get("affected_nodes", [])),
+                patch_operations_json=_json(operations),
+                score_gaps_json=_json(payload.get("score_gaps", {})),
+                next_round_hypotheses_json=_json(payload.get("next_round_hypotheses", [])),
+                created_at=now,
+            ))
+            state.active_strategy_version_id = after_version_id
+            state.updated_at = now
+            return after_version_id, after
+
+    async def sync_run_snapshot(self, context: Any) -> None:
+        await self.init()
+        async with self.session() as s:
+            row = await s.get(RunRecord, context.run_id)
+            if row is not None:
+                row.status = context.current_state.value
+                row.continuous_enabled = context.continuous_enabled
+                row.active_branch_id = context.active_branch_id
+                row.final_strategy_version_id = context.strategy_version_id
+                row.ended_at = context.ended_at
+            await s.commit()
+
     async def create_run(self, context: Any) -> None:
         await self.init()
         async with self.session() as s:
@@ -67,7 +168,17 @@ class SQLiteRepository:
                            payload_json=_json(event.payload), occurred_at=event.occurred_at))
             await s.commit()
 
-    async def persist_node(self, context: Any, node_key: str, output: Any, outcome: str, status: str = "SUCCEEDED") -> None:
+    async def persist_node(
+        self,
+        context: Any,
+        node_key: str,
+        output: Any,
+        outcome: str,
+        status: str = "SUCCEEDED",
+        *,
+        started_at: datetime | None = None,
+        ended_at: datetime | None = None,
+    ) -> None:
         async with self.session() as s:
             previous = await s.scalar(select(func.max(RunNodeExecution.attempt_no)).where(
                 RunNodeExecution.run_id == context.run_id,
@@ -77,8 +188,9 @@ class SQLiteRepository:
             s.add(RunNodeExecution(id=execution_id, run_id=context.run_id, branch_id=context.active_branch_id, node_key=node_key,
                                    attempt_no=(previous or 0) + 1, origin="AGENT", status=status, input_json=_json(context.active_artifacts),
                                    output_json=_json(output), next_state=context.current_node,
-                                   strategy_version_id=context.strategy_version_id or "", started_at=context.started_at,
-                                   ended_at=context.ended_at))
+                                   strategy_version_id=context.strategy_version_id or "",
+                                   started_at=started_at or datetime.utcnow(),
+                                   ended_at=ended_at or datetime.utcnow()))
             if node_key in {"N04", "N08"} and isinstance(output, dict):
                 evidence_type = (
                     "ORIGINAL_SEARCH_RESULT" if node_key == "N04" else "VARIANT_SEARCH_RESULT"
@@ -122,6 +234,53 @@ class SQLiteRepository:
                         content_status="VALID",
                         retrieved_at=datetime.utcnow(),
                     ))
+            await s.commit()
+
+    async def persist_node_failure(
+        self,
+        context: Any,
+        node_key: str,
+        *,
+        error_code: str,
+        error_message: str,
+        started_at: datetime | None = None,
+        ended_at: datetime | None = None,
+    ) -> None:
+        """Persist a failed attempt so the audit chain does not stop silently."""
+        await self.init()
+        async with self.session() as s:
+            previous = await s.scalar(select(func.max(RunNodeExecution.attempt_no)).where(
+                RunNodeExecution.run_id == context.run_id,
+                RunNodeExecution.branch_id == context.active_branch_id,
+                RunNodeExecution.node_key == node_key,
+            ))
+            s.add(RunNodeExecution(
+                id=__import__("uuid").uuid4().hex,
+                run_id=context.run_id,
+                branch_id=context.active_branch_id,
+                node_key=node_key,
+                attempt_no=(previous or 0) + 1,
+                origin="AGENT",
+                status="FAILED",
+                input_json=_json(context.active_artifacts),
+                output_json=None,
+                next_state=None,
+                strategy_version_id=context.strategy_version_id or "",
+                started_at=started_at or datetime.utcnow(),
+                ended_at=ended_at or datetime.utcnow(),
+                error_code=error_code,
+                error_message=error_message,
+            ))
+            await s.commit()
+
+    async def mark_run_retried(self, context: Any) -> None:
+        """Move a failed in-memory run back to an observable running state."""
+        async with self.session() as s:
+            row = await s.get(RunRecord, context.run_id)
+            if row:
+                row.status = "RUNNING"
+                row.ended_at = None
+                row.termination_reason = None
             await s.commit()
 
     async def persist_evaluation(self, context: Any, payload: dict[str, Any]) -> None:
@@ -177,6 +336,11 @@ class SQLiteRepository:
             row = await s.get(RunRecord, context.run_id)
             if row:
                 row.status = context.current_state.value; row.ended_at = context.ended_at
+                row.termination_reason = (
+                    context.event_buffer[-1].payload.get("error")
+                    if context.current_state.value == "FAILED" and context.event_buffer
+                    else None
+                )
                 row.continuous_enabled = context.continuous_enabled
                 n05 = context.node_outputs.get("N05", {})
                 n05 = n05.get("llm", n05) if isinstance(n05, dict) else {}

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
@@ -61,6 +62,7 @@ class RunContext:
     loop_counters: dict[str, int] = field(default_factory=dict)
     pause_requested: bool = False
     terminate_requested: bool = False
+    retry_available: bool = False
     pending_human_action: Any = None
     event_buffer: list[Any] = field(default_factory=list)
     node_outputs: dict[str, Any] = field(default_factory=dict)
@@ -83,6 +85,8 @@ class RunContext:
             "current_node": self.current_node, "state": self.current_state.value,
             "active_branch_id": self.active_branch_id,
             "strategy_version_id": self.strategy_version_id,
+            "strategy_snapshot": deepcopy(self.strategy_snapshot),
+            "retry_available": self.retry_available,
         }
 
     to_snapshot = snapshot
