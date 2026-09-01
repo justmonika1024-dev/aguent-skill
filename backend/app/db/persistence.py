@@ -28,6 +28,14 @@ from .models import (
     RunStrategyVersion,
 )
 
+_MODULAR_EVALUATION_KEYS = (
+    "original_search_plan",
+    "selected_original_meme",
+    "variant_search_plan",
+    "variant_search_results",
+    "template_extraction",
+)
+
 
 def _json(value: Any) -> Any:
     if hasattr(value, "model_dump"): return value.model_dump(mode="json")
@@ -331,11 +339,24 @@ class SQLiteRepository:
     async def persist_evaluation(self, context: Any, payload: dict[str, Any]) -> None:
         async with self.session() as s:
             decision = payload.get("admission_decision") or payload.get("admission", {}).get("decision")
-            s.add(RunHumanEvaluation(id=__import__("uuid").uuid4().hex, run_id=context.run_id,
-                                     branch_id=context.active_branch_id, processing_chain_scores_json=_json(payload.get("processing_chain", {})),
-                                     candidate_set_scores_json=_json(payload.get("candidate_set", {})), candidate_scores_json=_json(payload.get("candidates", {})), final_result_scores_json=_json(payload.get("final_result", {})),
-                                     main_problem_nodes_json=_json(payload.get("main_problem_nodes", [])), admission_decision=decision,
-                                     submitted_at=datetime.utcnow()))
+            processing_chain = {
+                key: _json(payload[key])
+                for key in _MODULAR_EVALUATION_KEYS
+                if key in payload
+            }
+            candidate_generation = payload.get("candidate_generation", {})
+            s.add(RunHumanEvaluation(
+                id=str(payload.get("evaluation_id") or uuid4().hex),
+                run_id=context.run_id,
+                branch_id=context.active_branch_id,
+                processing_chain_scores_json=processing_chain,
+                candidate_set_scores_json=_json(candidate_generation.get("overall", {})),
+                candidate_scores_json=_json(candidate_generation.get("candidates", {})),
+                final_result_scores_json=_json(payload.get("final_result", {})),
+                main_problem_nodes_json=_json(payload.get("main_problem_nodes", [])),
+                admission_decision=decision,
+                submitted_at=datetime.now(UTC),
+            ))
             row = await s.get(RunRecord, context.run_id)
             if row:
                 row.admission_decision = decision

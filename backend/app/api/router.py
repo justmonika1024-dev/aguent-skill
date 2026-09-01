@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
@@ -9,6 +10,7 @@ from fastapi import APIRouter, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from ..contracts.evaluation import HumanEvaluationRequest
 from ..workflow.context import AdmissionMode, RunMode, RunState
 from ..workflow.engine import WorkflowConflict, WorkflowEngine
 from ..workflow.events import Command
@@ -50,6 +52,40 @@ def set_engine(engine: WorkflowEngine) -> None:
     """Replace the process-local engine (used by integration tests/startup wiring)."""
     global _engine
     _engine = engine
+
+
+_MODULAR_EVALUATION_KEYS = (
+    "original_search_plan",
+    "selected_original_meme",
+    "variant_search_plan",
+    "variant_search_results",
+    "template_extraction",
+)
+
+
+def _evaluation_record(row: Any) -> dict[str, Any]:
+    processing_chain = row.processing_chain_scores_json or {}
+    common = {
+        "evaluation_id": row.id,
+        "final_result": row.final_result_scores_json,
+        "main_problem_nodes": row.main_problem_nodes_json,
+        "admission_decision": row.admission_decision,
+    }
+    if all(key in processing_chain for key in _MODULAR_EVALUATION_KEYS):
+        return {
+            **common,
+            **{key: processing_chain[key] for key in _MODULAR_EVALUATION_KEYS},
+            "candidate_generation": {
+                "overall": row.candidate_set_scores_json,
+                "candidates": row.candidate_scores_json,
+            },
+        }
+    return {
+        **common,
+        "processing_chain": row.processing_chain_scores_json,
+        "candidate_set": row.candidate_set_scores_json,
+        "candidates": row.candidate_scores_json,
+    }
 
 
 class RunCreate(BaseModel):
@@ -193,7 +229,8 @@ async def complete_run_record(run_id: str) -> dict[str, Any]:
         branches = (await session.execute(select(RunBranch).where(RunBranch.run_id == run_id)
                                           .order_by(RunBranch.created_at))).scalars().all()
         nodes = (await session.execute(select(RunNodeExecution).where(RunNodeExecution.run_id == run_id)
-                                       .order_by(RunNodeExecution.started_at))).scalars().all()
+                                       .order_by(RunNodeExecution.started_at,
+                                                 RunNodeExecution.id))).scalars().all()
         sources = (await session.execute(select(RunSourceEvidence).where(RunSourceEvidence.run_id == run_id)
                                          .order_by(RunSourceEvidence.retrieved_at))).scalars().all()
         evaluations = (await session.execute(select(RunHumanEvaluation).where(RunHumanEvaluation.run_id == run_id)
@@ -217,11 +254,7 @@ async def complete_run_record(run_id: str) -> dict[str, Any]:
                      "source_id": row.source_id, "provider": row.provider, "title": row.title,
                      "url": row.url, "canonical_url": row.canonical_url, "text": row.text,
                      "evidence_type": row.evidence_type, "content_status": row.content_status} for row in sources],
-        "evaluations": [{"evaluation_id": row.id, "processing_chain": row.processing_chain_scores_json,
-                         "candidate_set": row.candidate_set_scores_json, "candidates": row.candidate_scores_json,
-                         "final_result": row.final_result_scores_json,
-                         "main_problem_nodes": row.main_problem_nodes_json,
-                         "admission_decision": row.admission_decision} for row in evaluations],
+        "evaluations": [_evaluation_record(row) for row in evaluations],
         "events": [{"sequence": row.sequence, "event_type": row.event_type, "state": row.state,
                     "branch_id": row.branch_id, "payload": row.payload_json,
                     "occurred_at": row.occurred_at.isoformat()} for row in events],
@@ -291,16 +324,21 @@ async def command(run_id: str, body: CommandRequest) -> dict[str, Any]:
 
 
 @router.post("/runs/{run_id}/evaluation")
-async def submit_evaluation(run_id: str, body: dict[str, Any]) -> dict[str, Any]:
+async def submit_evaluation(run_id: str, body: HumanEvaluationRequest) -> dict[str, Any]:
     c = _engine.contexts.get(run_id)
     if c is None:
         raise HTTPException(404, detail={"code": "RUN_NOT_FOUND"})
-    expected = body.pop("expected_run_version", None)
-    branch = body.pop("branch_id", c.active_branch_id)
+    payload = body.model_dump()
+    expected = payload.pop("expected_run_version")
+    branch = payload.pop("branch_id")
     if branch != c.active_branch_id or expected != c.run_version:
         raise HTTPException(409, detail={"code": "RUN_VERSION_CONFLICT"})
-    return await _engine.command(run_id, Command(type="EVALUATION_SUBMITTED", expected_run_version=expected,
-                                                 payload=body))
+    return await _engine.submit_evaluation(
+        run_id,
+        payload,
+        expected_run_version=expected,
+        branch_id=branch,
+    )
 
 
 @router.get("/runs/{run_id}/evaluation-form")
@@ -427,16 +465,89 @@ async def restore_meme(meme_id: str) -> dict[str, Any]:
 
 @router.get("/strategies")
 async def list_strategies() -> list[dict[str, Any]]:
-    return []
+    repository = getattr(_engine, "repository", None)
+    if repository is None:
+        return []
+    await repository.ensure_active_strategy()
+    from sqlalchemy import select
+
+    from ..db.models import RunStrategyState, RunStrategyVersion
+    async with repository.session() as session:
+        state = await session.get(RunStrategyState, 1)
+        versions = (await session.execute(
+            select(RunStrategyVersion).order_by(RunStrategyVersion.version_number)
+        )).scalars().all()
+    active_id = state.active_strategy_version_id if state else None
+    return [{
+        "strategy_id": version.id,
+        "version_number": version.version_number,
+        "parent_version_id": version.parent_version_id,
+        "source_run_id": version.source_run_id,
+        "source_evaluation_id": version.source_evaluation_id,
+        "change_summary": version.change_summary,
+        "created_at": version.created_at.isoformat(),
+        "is_active": version.id == active_id,
+    } for version in versions]
 
 
 @router.get("/strategies/{strategy_id}")
 async def get_strategy(strategy_id: str) -> dict[str, Any]:
-    raise HTTPException(404, detail={"code": "STRATEGY_NOT_FOUND"})
+    repository = getattr(_engine, "repository", None)
+    if repository is None:
+        raise HTTPException(404, detail={"code": "STRATEGY_NOT_FOUND"})
+    await repository.init()
+    from sqlalchemy import select
+
+    from ..db.models import RunStrategyPatch, RunStrategyState, RunStrategyVersion
+    async with repository.session() as session:
+        version = await session.get(RunStrategyVersion, strategy_id)
+        if version is None:
+            raise HTTPException(404, detail={"code": "STRATEGY_NOT_FOUND"})
+        state = await session.get(RunStrategyState, 1)
+        patch = await session.scalar(select(RunStrategyPatch).where(
+            RunStrategyPatch.after_version_id == strategy_id
+        ))
+    return {
+        "strategy_id": version.id,
+        "version_number": version.version_number,
+        "parent_version_id": version.parent_version_id,
+        "strategy": version.strategy_json,
+        "source_run_id": version.source_run_id,
+        "source_evaluation_id": version.source_evaluation_id,
+        "change_summary": version.change_summary,
+        "created_at": version.created_at.isoformat(),
+        "is_active": bool(state and state.active_strategy_version_id == version.id),
+        "patch_id": patch.id if patch else None,
+        "feedback_summary": patch.feedback_summary if patch else "",
+        "affected_nodes": patch.affected_nodes_json if patch else [],
+        "patch_operations": patch.patch_operations_json if patch else [],
+        "score_gaps": patch.score_gaps_json if patch else {},
+        "next_round_hypotheses": patch.next_round_hypotheses_json if patch else [],
+    }
 
 
 @router.post("/strategies/{strategy_id}/activate")
 async def activate_strategy(strategy_id: str) -> dict[str, Any]:
     if _engine.active is not None:
         raise HTTPException(409, detail={"code": "ACTIVE_RUN_EXISTS"})
-    raise HTTPException(404, detail={"code": "STRATEGY_NOT_FOUND"})
+    repository = getattr(_engine, "repository", None)
+    if repository is None:
+        raise HTTPException(404, detail={"code": "STRATEGY_NOT_FOUND"})
+    await repository.init()
+    from ..db.models import RunStrategyState, RunStrategyVersion
+    async with repository.session() as session, session.begin():
+        version = await session.get(RunStrategyVersion, strategy_id)
+        if version is None:
+            raise HTTPException(404, detail={"code": "STRATEGY_NOT_FOUND"})
+        state = await session.get(RunStrategyState, 1)
+        if state is None:
+            state = RunStrategyState(
+                id=1,
+                active_strategy_version_id=strategy_id,
+                updated_at=datetime.now(UTC),
+            )
+            session.add(state)
+        else:
+            state.active_strategy_version_id = strategy_id
+            state.updated_at = datetime.now(UTC)
+    return {"strategy_id": strategy_id, "is_active": True}

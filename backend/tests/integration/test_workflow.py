@@ -72,6 +72,69 @@ class InvalidFeedbackN19(FakeNode):
         }
 
 
+def complete_evaluation_payload(expected_run_version: int, branch_id: str) -> dict:
+    candidate = {
+        "fluency": 4,
+        "original_meme_recognition": 4,
+        "agu_zao_naturalness": 4,
+        "humor": 4,
+        "template_logic": 4,
+        "usability": "USABLE",
+    }
+    return {
+        "expected_run_version": expected_run_version,
+        "branch_id": branch_id,
+        "original_search_plan": {
+            "anchor_accuracy": 4,
+            "query_coverage": 4,
+            "plan_targeting": 4,
+        },
+        "selected_original_meme": {
+            "popularity": 4,
+            "applicability": 4,
+            "adaptability": 4,
+            "evidence_reliability": 4,
+        },
+        "variant_search_plan": {
+            "slot_replacement_targeting": 4,
+            "query_diversity": 4,
+            "ugc_orientation": 4,
+            "noise_avoidance": 4,
+        },
+        "variant_search_results": {
+            "relevance": 4,
+            "real_variant_ratio": 4,
+            "independent_evidence_quality": 4,
+            "variant_diversity": 4,
+        },
+        "template_extraction": {
+            "accuracy": 4,
+            "original_reconstruction": 4,
+            "variant_coverage": 4,
+            "slot_rationality": 4,
+        },
+        "candidate_generation": {
+            "overall": {
+                "effective_difference": 4,
+                "natural_rewrite_coverage": 4,
+                "overall_selectable_quality": 4,
+            },
+            "candidates": {f"C{index}": dict(candidate) for index in range(1, 6)},
+        },
+        "final_result": {
+            "is_best_candidate": True,
+            "better_candidate_id": None,
+            "fluency": 4,
+            "original_meme_recognition": 4,
+            "agu_zao_fit": 4,
+            "humor": 4,
+            "overall_satisfaction": 4,
+        },
+        "main_problem_nodes": ["NO_OBVIOUS_PROBLEM"],
+        "admission": {"decision": "ADMIT"},
+    }
+
+
 @pytest.mark.parametrize(("mode", "expected"), [
     (RunMode.AUTO_DISCOVERY, "N02"),
     (RunMode.MANUAL_SEED, "WAITING_HUMAN_INTERVENTION"),
@@ -363,11 +426,12 @@ async def test_default_run_nodes_are_json_serializable_after_evaluation():
             if snapshot["state"] == "WAITING_HUMAN_EVALUATION":
                 break
             await asyncio.sleep(0.001)
-        response = await client.post(f"/api/v1/runs/{run_id}/evaluation", json={
-            "expected_run_version": snapshot["run_version"],
-            "branch_id": snapshot["active_branch_id"],
-            "score": 5,
-        })
+        response = await client.post(
+            f"/api/v1/runs/{run_id}/evaluation",
+            json=complete_evaluation_payload(
+                snapshot["run_version"], snapshot["active_branch_id"],
+            ),
+        )
         assert response.status_code == 200
         for _ in range(200):
             final_snapshot = (await client.get(f"/api/v1/runs/{run_id}")).json()

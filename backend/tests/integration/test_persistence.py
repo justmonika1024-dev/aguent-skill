@@ -1,6 +1,9 @@
 import asyncio
+import importlib
+from types import SimpleNamespace
 
 import pytest
+from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 
 from app.db.models import (
@@ -17,6 +20,7 @@ from app.db.models import (
     RunStrategyVersion,
 )
 from app.db.persistence import SQLiteRepository
+from app.main import app
 from app.services.strategy import StrategyService, default_strategy
 from app.workflow.context import AdmissionMode, RunContext, RunMode, RunState
 from app.workflow.engine import WorkflowEngine
@@ -122,6 +126,66 @@ async def test_repository_versions_strategy_and_syncs_waiting_state(tmp_path):
     assert state.active_strategy_version_id == after_id
     assert persisted_patch.before_version_id == version_id
     assert persisted_patch.after_version_id == after_id
+
+
+@pytest.mark.asyncio
+async def test_strategy_api_lists_versions_returns_patch_audit_and_activates_version(
+    tmp_path, monkeypatch,
+):
+    repo = SQLiteRepository(f"sqlite+aiosqlite:///{tmp_path / 'strategy-api.db'}")
+    first_id, _ = await repo.ensure_active_strategy()
+    second_id, second_strategy = await repo.apply_strategy_patch(
+        source_run_id="run-1",
+        evaluation_id="eval-1",
+        before_version_id=first_id,
+        patch={
+            "feedback_summary": "变式转载过多",
+            "affected_nodes": ["N07", "N09"],
+            "patch_operations": [{
+                "op": "add",
+                "path": "/search/variant_query_directives/-",
+                "value": "排除原句转载",
+            }],
+            "score_gaps": {"variant_search_results.real_variant_ratio": -2},
+            "next_round_hypotheses": ["真实变式比例提升"],
+        },
+    )
+    api_router = importlib.import_module("app.api.router")
+    monkeypatch.setattr(
+        api_router,
+        "_engine",
+        SimpleNamespace(repository=repo, contexts={}, active=None),
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/api/v1/strategies")
+        assert response.status_code == 200
+        versions = response.json()
+        assert [version["version_number"] for version in versions] == [1, 2]
+        assert [version["strategy_id"] for version in versions if version["is_active"]] == [second_id]
+
+        detail_response = await client.get(f"/api/v1/strategies/{second_id}")
+        assert detail_response.status_code == 200
+        detail = detail_response.json()
+        assert detail["strategy"] == second_strategy
+        assert detail["feedback_summary"] == "变式转载过多"
+        assert detail["affected_nodes"] == ["N07", "N09"]
+        assert detail["patch_operations"][0]["path"] == "/search/variant_query_directives/-"
+        assert detail["source_evaluation_id"] == "eval-1"
+
+        activated = await client.post(f"/api/v1/strategies/{first_id}/activate")
+        assert activated.status_code == 200
+        assert activated.json() == {"strategy_id": first_id, "is_active": True}
+
+        monkeypatch.setattr(api_router._engine, "active", object())
+        conflict = await client.post(f"/api/v1/strategies/{second_id}/activate")
+        assert conflict.status_code == 409
+        missing = await client.get("/api/v1/strategies/missing")
+        assert missing.status_code == 404
+
+    async with repo.session() as session:
+        state = await session.get(RunStrategyState, 1)
+    assert state.active_strategy_version_id == first_id
 
 
 @pytest.mark.asyncio
