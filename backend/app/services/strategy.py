@@ -42,6 +42,23 @@ _INTEGER_RANGES = {
 }
 
 
+def _leaf_paths(value: Any, prefix: tuple[str, ...] = ()) -> set[tuple[str, ...]]:
+    if not isinstance(value, dict):
+        return {prefix}
+    return {
+        path
+        for key, child in value.items()
+        for path in _leaf_paths(child, (*prefix, key))
+    }
+
+
+_KNOWN_LEAF_PATHS = _leaf_paths(DEFAULT_STRATEGY)
+_LIST_PATHS = {
+    path for path in _KNOWN_LEAF_PATHS
+    if isinstance(DEFAULT_STRATEGY[path[0]][path[1]], list)
+}
+
+
 def default_strategy() -> dict[str, Any]:
     return deepcopy(DEFAULT_STRATEGY)
 
@@ -76,8 +93,17 @@ class StrategyService:
 
     @staticmethod
     def _validate_value(parts: list[str], value: Any) -> None:
+        path = tuple(parts[:-1] if parts[-1] == "-" else parts)
+        if path not in _KNOWN_LEAF_PATHS:
+            raise ValueError(f"strategy path is not a known leaf: {'/'.join(parts)}")
         field = parts[-1]
         if field == "-":
+            if path not in _LIST_PATHS or not isinstance(value, str):
+                raise ValueError("array append is only allowed for string directives")
+            return
+        if path in _LIST_PATHS:
+            if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+                raise ValueError(f"{field} must be a list of strings")
             return
         if field.startswith(("prefer_", "exclude_", "require_", "reject_")):
             if type(value) is not bool:
@@ -134,5 +160,8 @@ class StrategyService:
                 raise ValueError("'/-' requires an array target")
             if op["op"] == "replace" and field not in target:
                 raise ValueError(f"replace target does not exist: {field}")
-            target[field] = deepcopy(op["value"])
+            value = deepcopy(op["value"])
+            if tuple(parts) in _LIST_PATHS:
+                value = list(dict.fromkeys(value))
+            target[field] = value
         return result

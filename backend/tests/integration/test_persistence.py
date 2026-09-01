@@ -6,6 +6,7 @@ from sqlalchemy import select
 from app.db.models import (
     MemeRecord,
     MemeSource,
+    RunBranch,
     RunEvent,
     RunHumanEvaluation,
     RunNodeExecution,
@@ -19,7 +20,7 @@ from app.db.persistence import SQLiteRepository
 from app.services.strategy import StrategyService, default_strategy
 from app.workflow.context import AdmissionMode, RunContext, RunMode, RunState
 from app.workflow.engine import WorkflowEngine
-from app.workflow.events import Command
+from app.workflow.events import Command, EventBus
 from app.workflow.registry import NodeRegistry
 
 
@@ -69,6 +70,23 @@ def test_strategy_defaults_are_isolated_and_patches_are_validated():
     for operation in invalid_operations:
         with pytest.raises(ValueError):
             service.apply(second, {"operations": [operation]})
+
+
+def test_strategy_rejects_whole_section_replacement_that_bypasses_leaf_guards():
+    malicious_search = {
+        **default_strategy()["search"],
+        "prefer_ugc_sources": "true",
+        "minimum_template_coverage": 1.1,
+        "candidate_count": 99,
+        "routes": {"N09": "COMPLETED"},
+    }
+
+    with pytest.raises(ValueError):
+        StrategyService().apply(default_strategy(), {"operations": [{
+            "op": "replace",
+            "path": "/search",
+            "value": malicious_search,
+        }]})
 
 
 @pytest.mark.asyncio
@@ -134,6 +152,67 @@ async def test_engine_syncs_waiting_state_and_continuous_setting(tmp_path):
         run = await session.get(RunRecord, ctx.run_id)
     assert run.status == "WAITING_HUMAN_EVALUATION"
     assert run.continuous_enabled is ctx.continuous_enabled is False
+
+
+@pytest.mark.asyncio
+async def test_sync_run_snapshot_persists_live_selected_and_final_fields(tmp_path):
+    repo = SQLiteRepository(f"sqlite+aiosqlite:///{tmp_path / 'live-fields.db'}")
+    ctx = RunContext(mode=RunMode.MANUAL_SEED, admission_mode=AdmissionMode.HUMAN)
+    await repo.create_run(ctx)
+    ctx.current_state = RunState.WAITING_HUMAN_EVALUATION
+    ctx.node_outputs.update({
+        "N05": {"llm": {
+            "title": "原神介绍体",
+            "original_text": "你说的对，但是《原神》是开放世界冒险游戏。",
+        }},
+        "N14": {"llm": {"selected_candidate_id": "C3"}},
+        "N15": {"llm": {
+            "selected_candidate_id": "C3",
+            "final_agu_text": "你说的对，但是铁凿正在凿agu。",
+        }},
+    })
+
+    await repo.sync_run_snapshot(ctx)
+
+    async with repo.session() as session:
+        run = await session.get(RunRecord, ctx.run_id)
+    assert run.status == "WAITING_HUMAN_EVALUATION"
+    assert run.selected_original_title == "原神介绍体"
+    assert run.selected_original_text.startswith("你说的对，但是《原神》")
+    assert run.selected_candidate_id == "C3"
+    assert run.final_agu_text == "你说的对，但是铁凿正在凿agu。"
+
+
+@pytest.mark.asyncio
+async def test_correct_node_output_persists_and_activates_new_branch(tmp_path):
+    repo = SQLiteRepository(f"sqlite+aiosqlite:///{tmp_path / 'branches.db'}")
+    ctx = RunContext(mode=RunMode.MANUAL_SEED, admission_mode=AdmissionMode.HUMAN)
+    root_branch_id = ctx.active_branch_id
+    ctx.branches[root_branch_id] = {"parent_branch_id": None, "origin": "ROOT"}
+    ctx.current_state = RunState.PAUSED
+    await repo.create_run(ctx)
+    engine = WorkflowEngine(NodeRegistry(), repository=repo)
+    engine.contexts[ctx.run_id] = ctx
+    engine.buses[ctx.run_id] = EventBus()
+
+    await engine.command(ctx.run_id, Command(
+        "CORRECT_NODE_OUTPUT",
+        expected_run_version=ctx.run_version,
+        payload={"node_key": "N12", "corrected_output": {"candidates": []}},
+    ))
+    corrected_branch_id = ctx.active_branch_id
+
+    async with repo.session() as session:
+        run = await session.get(RunRecord, ctx.run_id)
+        branches = (await session.execute(
+            select(RunBranch).where(RunBranch.run_id == ctx.run_id).order_by(RunBranch.created_at)
+        )).scalars().all()
+    assert run.active_branch_id == corrected_branch_id
+    assert [(branch.id, branch.parent_branch_id, branch.is_final_active) for branch in branches] == [
+        (root_branch_id, None, False),
+        (corrected_branch_id, root_branch_id, True),
+    ]
+    assert branches[-1].fork_reason == "HUMAN_CORRECTION"
 
 
 @pytest.mark.asyncio

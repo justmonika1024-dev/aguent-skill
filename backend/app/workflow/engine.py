@@ -104,7 +104,15 @@ class WorkflowEngine:
             context.active_branch_id = branch_id
         elif command.type == "CORRECT_NODE_OUTPUT":
             branch_id = str(__import__('uuid').uuid4())
-            context.branches[branch_id] = {"parent_branch_id": context.active_branch_id,
+            parent_branch_id = context.active_branch_id
+            if self.repository:
+                await self.repository.persist_corrected_branch(
+                    run_id=context.run_id,
+                    branch_id=branch_id,
+                    parent_branch_id=parent_branch_id,
+                    forked_from_execution_id=command.payload.get("forked_from_execution_id"),
+                )
+            context.branches[branch_id] = {"parent_branch_id": parent_branch_id,
                                            "origin": "HUMAN_CORRECTION", "payload": command.payload}
             context.active_branch_id = branch_id
             context.current_node = command.payload.get("node_key", context.current_node)

@@ -38,6 +38,16 @@ def _json(value: Any) -> Any:
     return value
 
 
+def _run_summary_payloads(context: Any) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    n05 = context.node_outputs.get("N05", {})
+    n05 = n05.get("llm", n05) if isinstance(n05, dict) else {}
+    n14 = context.node_outputs.get("N14", {})
+    n14 = n14.get("llm", n14) if isinstance(n14, dict) else {}
+    n15 = context.node_outputs.get("N15", {})
+    n15 = n15.get("llm", n15) if isinstance(n15, dict) else {}
+    return n05, n14, n15
+
+
 class SQLiteRepository:
     def __init__(self, database_url: str = "sqlite+aiosqlite:///./data/agugent.db") -> None:
         self.engine = create_async_engine(database_url)
@@ -144,11 +154,18 @@ class SQLiteRepository:
         async with self.session() as s:
             row = await s.get(RunRecord, context.run_id)
             if row is not None:
+                n05, n14, final = _run_summary_payloads(context)
                 row.status = context.current_state.value
                 row.continuous_enabled = context.continuous_enabled
                 row.active_branch_id = context.active_branch_id
                 row.final_strategy_version_id = context.strategy_version_id
                 row.ended_at = context.ended_at
+                row.selected_original_title = n05.get("title")
+                row.selected_original_text = n05.get("original_text")
+                row.selected_candidate_id = (
+                    n14.get("selected_candidate_id") or final.get("selected_candidate_id")
+                )
+                row.final_agu_text = final.get("final_agu_text")
             await s.commit()
 
     async def create_run(self, context: Any) -> None:
@@ -160,6 +177,34 @@ class SQLiteRepository:
                             active_branch_id=context.active_branch_id, started_at=context.started_at, created_at=context.started_at))
             s.add(RunBranch(id=context.active_branch_id, run_id=context.run_id, fork_reason="ROOT", is_final_active=True, created_at=context.started_at))
             await s.commit()
+
+    async def persist_corrected_branch(
+        self,
+        *,
+        run_id: str,
+        branch_id: str,
+        parent_branch_id: str,
+        forked_from_execution_id: str | None = None,
+    ) -> None:
+        await self.init()
+        async with self.session() as s, s.begin():
+            previous = await s.get(RunBranch, parent_branch_id)
+            run = await s.get(RunRecord, run_id)
+            if previous is None or previous.run_id != run_id or run is None:
+                raise ValueError("cannot fork from an unknown run branch")
+            if await s.get(RunBranch, branch_id) is not None:
+                raise ValueError("branch already exists")
+            previous.is_final_active = False
+            s.add(RunBranch(
+                id=branch_id,
+                run_id=run_id,
+                parent_branch_id=parent_branch_id,
+                forked_from_execution_id=forked_from_execution_id,
+                fork_reason="HUMAN_CORRECTION",
+                is_final_active=True,
+                created_at=datetime.now(UTC),
+            ))
+            run.active_branch_id = branch_id
 
     async def persist_event(self, event: Any) -> None:
         async with self.session() as s:
@@ -342,18 +387,13 @@ class SQLiteRepository:
                     else None
                 )
                 row.continuous_enabled = context.continuous_enabled
-                n05 = context.node_outputs.get("N05", {})
-                n05 = n05.get("llm", n05) if isinstance(n05, dict) else {}
-                n14 = context.node_outputs.get("N14", {})
-                n14 = n14.get("llm", n14) if isinstance(n14, dict) else {}
-                final = context.node_outputs.get("N15", {})
-                final_llm = final.get("llm", final) if isinstance(final, dict) else {}
-                row.selected_original_title = n05.get("title") if isinstance(n05, dict) else None
-                row.selected_original_text = n05.get("original_text") if isinstance(n05, dict) else None
+                n05, n14, final_llm = _run_summary_payloads(context)
+                row.selected_original_title = n05.get("title")
+                row.selected_original_text = n05.get("original_text")
                 row.selected_candidate_id = (
-                    n14.get("selected_candidate_id") if isinstance(n14, dict) else None
-                ) or (final_llm.get("selected_candidate_id") if isinstance(final_llm, dict) else None)
-                row.final_agu_text = final_llm.get("final_agu_text") if isinstance(final_llm, dict) else None
+                    n14.get("selected_candidate_id") or final_llm.get("selected_candidate_id")
+                )
+                row.final_agu_text = final_llm.get("final_agu_text")
                 row.total_llm_input_tokens = await s.scalar(select(
                     func.coalesce(func.sum(RunAPICall.input_tokens), 0)
                 ).where(RunAPICall.run_id == context.run_id, RunAPICall.api_type == "llm")) or 0
