@@ -38,8 +38,8 @@ class AdmissionService:
             )
             return AdmissionDecision("NOT_ADMIT", reason, safety)
 
-        raw_score = artifact.get("score", artifact.get("overall_score"))
-        raw_threshold = artifact.get("threshold", 6.0)
+        raw_score = artifact.get("score")
+        raw_threshold = artifact.get("threshold")
         if (not isinstance(raw_score, (int, float)) or isinstance(raw_score, bool)
                 or not isfinite(float(raw_score))
                 or not 0 <= float(raw_score) <= 10):

@@ -2,12 +2,13 @@ import asyncio
 import importlib
 from datetime import UTC, datetime
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 
-from app.db.models import MemeRecord, RunHumanEvaluation, RunStrategyPatch
+from app.db.models import MemeRecord, RunHumanEvaluation, RunRecord, RunStrategyPatch
 from app.db.persistence import SQLiteRepository
 from app.main import app
 from app.providers.fake import FakeLLMProvider, FakeSearchProvider
@@ -432,6 +433,79 @@ async def test_modular_evaluation_cannot_force_admission_without_passed_safety(
         evaluations = (await session.execute(select(RunHumanEvaluation))).scalars().all()
         formal_records = (await session.execute(select(MemeRecord))).scalars().all()
     await repository.engine.dispose()
+    assert evaluations == []
+    assert formal_records == []
+
+
+@pytest.mark.asyncio
+async def test_generic_command_api_rejects_internal_evaluation_without_side_effects(
+    tmp_path, monkeypatch,
+):
+    repository = SQLiteRepository(
+        f"sqlite+aiosqlite:///{tmp_path / 'internal-evaluation-command.db'}",
+    )
+    engine = WorkflowEngine(repository=repository)
+    context = RunContext(
+        mode=RunMode.AUTO_DISCOVERY,
+        admission_mode=AdmissionMode.AUTO,
+        current_node="N18",
+        current_state=RunState.WAITING_HUMAN_EVALUATION,
+    )
+    n16 = {
+        "score": 9,
+        "threshold": 6,
+        "safety": "REJECT",
+        "failed_conditions": ["CONTENT_SAFETY_NOT_PASS"],
+        "decision_basis": "内容安全结果为REJECT",
+    }
+    context.active_artifacts["N16"] = n16
+    context.node_outputs["N16"] = n16
+    engine.contexts[context.run_id] = context
+    engine.buses[context.run_id] = EventBus()
+    await repository.create_run(context)
+    api_router = importlib.import_module("app.api.router")
+    monkeypatch.setattr(api_router, "_engine", engine)
+    state_before = (
+        context.current_state,
+        context.current_node,
+        context.run_version,
+        context.pending_human_action,
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            f"/api/v1/runs/{context.run_id}/commands",
+            json={
+                "command_id": str(uuid4()),
+                "type": "EVALUATION_SUBMITTED",
+                "expected_run_version": context.run_version,
+                "payload": {
+                    "admission_decision": "ADMIT",
+                    "unvalidated": "arbitrary payload",
+                },
+            },
+        )
+
+    assert response.status_code == 422
+    error = response.json()["error"]
+    assert error["code"] == "COMMAND_TYPE_NOT_ALLOWED"
+    assert f"/runs/{context.run_id}/evaluation" in error["message"]
+    assert error["details"] == {}
+    assert error["request_id"]
+    assert (
+        context.current_state,
+        context.current_node,
+        context.run_version,
+        context.pending_human_action,
+    ) == state_before
+    async with repository.session() as session:
+        persisted_run = await session.get(RunRecord, context.run_id)
+        evaluations = (await session.execute(select(RunHumanEvaluation))).scalars().all()
+        formal_records = (await session.execute(select(MemeRecord))).scalars().all()
+    await repository.engine.dispose()
+    assert persisted_run is not None
+    assert persisted_run.status == "WAITING_HUMAN_EVALUATION"
+    assert persisted_run.admission_decision is None
     assert evaluations == []
     assert formal_records == []
 

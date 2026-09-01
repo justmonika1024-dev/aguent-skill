@@ -200,23 +200,93 @@ async def test_real_registry_n16_fails_closed_when_selected_score_contract_is_in
 
 
 @pytest.mark.asyncio
-async def test_real_registry_n17_rejects_quality_score_outside_zero_to_ten_scale():
+@pytest.mark.parametrize(("artifact", "reason_fragment"), [
+    pytest.param(
+        {"threshold": 6, "safety": "PASS", "failed_conditions": []},
+        "综合质量分",
+        id="missing-score",
+    ),
+    pytest.param(
+        {"score": 8, "safety": "PASS", "failed_conditions": []},
+        "质量门槛",
+        id="missing-threshold",
+    ),
+    pytest.param(
+        {
+            "overall_score": 8,
+            "threshold": 6,
+            "safety": "PASS",
+            "failed_conditions": [],
+        },
+        "综合质量分",
+        id="overall-score-only",
+    ),
+    pytest.param(
+        {"score": float("nan"), "threshold": 6, "safety": "PASS", "failed_conditions": []},
+        "综合质量分",
+        id="nan-score",
+    ),
+    pytest.param(
+        {"score": float("inf"), "threshold": 6, "safety": "PASS", "failed_conditions": []},
+        "综合质量分",
+        id="infinite-score",
+    ),
+    pytest.param(
+        {"score": -0.01, "threshold": 6, "safety": "PASS", "failed_conditions": []},
+        "综合质量分",
+        id="score-below-zero",
+    ),
+    pytest.param(
+        {"score": 10.01, "threshold": 6, "safety": "PASS", "failed_conditions": []},
+        "综合质量分",
+        id="score-above-ten",
+    ),
+    pytest.param(
+        {"score": 8, "threshold": float("nan"), "safety": "PASS", "failed_conditions": []},
+        "质量门槛",
+        id="nan-threshold",
+    ),
+    pytest.param(
+        {"score": 8, "threshold": float("inf"), "safety": "PASS", "failed_conditions": []},
+        "质量门槛",
+        id="infinite-threshold",
+    ),
+    pytest.param(
+        {"score": 8, "threshold": -0.01, "safety": "PASS", "failed_conditions": []},
+        "质量门槛",
+        id="threshold-below-zero",
+    ),
+    pytest.param(
+        {"score": 8, "threshold": 10.01, "safety": "PASS", "failed_conditions": []},
+        "质量门槛",
+        id="threshold-above-ten",
+    ),
+    pytest.param(
+        {"score": 8, "threshold": 6, "safety": "PASS"},
+        "ADMISSION_CONTRACT_INVALID",
+        id="missing-failed-conditions",
+    ),
+    pytest.param(
+        {"score": 8, "threshold": 6, "safety": "PASS", "failed_conditions": "none"},
+        "ADMISSION_CONTRACT_INVALID",
+        id="failed-conditions-not-list",
+    ),
+])
+async def test_real_registry_n17_rejects_non_contract_admission_artifacts(
+    artifact, reason_fragment,
+):
     registry = build_real_registry(
         llm=FakeLLMProvider(), search=FakeSearchProvider(),
         repository=EmptyFormalMemeRepositoryStub(),
     )
 
     n17 = await registry.get("N17").execute({
-        "N16": {
-            "score": 11,
-            "threshold": 6,
-            "safety": "PASS",
-            "failed_conditions": [],
-        },
+        "N16": artifact,
     }, {"admission_mode": "AUTO"})
 
     assert n17.output["admission_decision"] == "NOT_ADMIT"
-    assert "0-10" in n17.output["reason"]
+    assert reason_fragment in n17.output["reason"]
+    assert n17.output["reason"].strip()
 
 
 def test_low_variant_scores_force_search_quality_patch():

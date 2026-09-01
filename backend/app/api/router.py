@@ -391,6 +391,14 @@ async def get_node(run_id: str, execution_id: str) -> dict[str, Any]:
 
 @router.post("/runs/{run_id}/commands")
 async def command(run_id: str, body: CommandRequest) -> dict[str, Any]:
+    if body.type == "EVALUATION_SUBMITTED":
+        raise HTTPException(422, detail={
+            "code": "COMMAND_TYPE_NOT_ALLOWED",
+            "message": (
+                "EVALUATION_SUBMITTED must be submitted via "
+                f"/runs/{run_id}/evaluation"
+            ),
+        })
     try:
         return await _engine.command(run_id, Command(type=body.type, command_id=str(body.command_id),
                                                      expected_run_version=body.expected_run_version,
