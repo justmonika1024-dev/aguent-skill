@@ -37,9 +37,31 @@ button, input, textarea { font: inherit; }
 .score-grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(220px,1fr)); column-gap: 20px; }
 .final-copy { margin: 0 !important; font-size: 20px; line-height: 1.8; white-space: pre-wrap; }
 .sticky-submit { position: sticky; bottom: 14px; z-index: 5; display: flex; justify-content: flex-end; padding: 14px 18px; border: 1px solid #dfe3ed; border-radius: 14px; background: rgba(255,255,255,.94); box-shadow: 0 12px 35px rgb(15 23 42 / 12%); backdrop-filter: blur(12px); }
+.evaluation-form { display: grid; gap: 20px; padding-bottom: 96px; }
+.evaluation-module-card .ant-card-body, .evaluation-decision-card .ant-card-body { min-width: 0; }
+.run-artifact-summary { display: grid; gap: 12px; max-height: min(42vh, 420px); margin-bottom: 22px; padding-right: 4px; overflow: auto; overscroll-behavior: contain; }
+.run-artifact-node { min-width: 0; padding: 14px 16px; border: 1px solid #e6e9f0; border-radius: 12px; background: #f8f9fc; }
+.run-artifact-node .ant-typography, .run-artifact-node li, .artifact-evidence-item { overflow-wrap: anywhere; word-break: break-word; }
+.run-artifact-node h5.ant-typography { margin: 0 0 8px; }
+.run-artifact-node ul { margin: 0; padding-left: 20px; }
+.run-artifact-node a { white-space: normal; overflow-wrap: anywhere; word-break: break-all; }
+.artifact-evidence-list { display: grid; gap: 10px; max-height: 320px; overflow: auto; }
+.artifact-evidence-item { padding: 10px 12px; border-radius: 9px; background: white; }
+.candidate-evaluation-list { margin: 18px 0 22px; }
+.evaluation-form .ant-form-item-explain-error { scroll-margin-bottom: 120px; }
+.sticky-submit > .ant-space { flex-wrap: wrap; justify-content: flex-end; }
 
 @media (max-width: 768px) {
   .app-header { padding: 12px 16px; }
   .app-content { padding: 16px; }
   .page-heading { flex-direction: column; }
+  .evaluation-page .surface { padding: 16px; }
+  .evaluation-form { padding-bottom: 118px; }
+  .score-grid { grid-template-columns: minmax(0,1fr); }
+  .score-grid .ant-radio-group { display: flex; flex-wrap: wrap; }
+  .run-artifact-summary { max-height: 360px; }
+  .sticky-submit { bottom: 8px; padding: 12px; }
+  .sticky-submit > .ant-space { width: 100%; align-items: stretch; }
+  .sticky-submit .ant-typography { width: 100%; }
+  .sticky-submit button { width: 100%; }
 }
