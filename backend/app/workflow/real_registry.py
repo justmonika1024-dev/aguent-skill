@@ -922,7 +922,7 @@ def _has_coordinated_other_object(text: str) -> bool:
     )
     for action in _ACTION_ON_AGU.finditer(text):
         coordinated = re.match(
-            r"\s*(?:和|与|及|、|，|,)\s*([^。！？!?；;]*)",
+            r"\s*(?:和|与|及|、|，|,)\s*([^，,。！？!?；;]*)",
             text[action.end():],
         )
         if coordinated is None:

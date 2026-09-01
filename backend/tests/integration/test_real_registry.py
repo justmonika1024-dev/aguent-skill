@@ -1886,6 +1886,8 @@ async def test_n13_rejects_coordinated_other_recipient_without_blocking_new_pred
         "C8": "他凿agu，回家",
         "C9": "他凿agu和朋友",
         "C10": "他凿agu和小王聊天",
+        "C11": "他凿agu和小王，然后回家",
+        "C12": "他凿agu、小王，随后回家",
     }
     high_score = {
         "fluency": 10,
@@ -1915,7 +1917,7 @@ async def test_n13_rejects_coordinated_other_recipient_without_blocking_new_pred
     assert payload["qualified_candidate_ids"] == [
         "C3", "C4", "C5", "C6", "C7", "C8", "C10",
     ]
-    for candidate_id in ("C1", "C2", "C9"):
+    for candidate_id in ("C1", "C2", "C9", "C11", "C12"):
         assert scores[candidate_id]["agu_fit"] < 6
         assert scores[candidate_id]["qualified"] is False
         assert "其他动作受事" in "".join(scores[candidate_id]["problems"])
