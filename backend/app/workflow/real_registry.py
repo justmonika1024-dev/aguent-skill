@@ -917,13 +917,10 @@ def _invalid_agu_identity(text: str) -> bool:
 
 def _has_action_on_other_object(text: str) -> bool:
     remaining = _ACTION_ON_AGU.sub("", text)
-    active = re.compile(
-        r"(?:^|[，。！？,!?；;]|我|你|他|她|我们|你们|他们|她们|群友|大家|"
-        r"先|又|再|正在|已经|还在|开始|继续|直接|竟然|居然|偷偷|狠狠地?)"
-        r"\s*凿(?P<tail>[^，。！？,!?；;\s]{1,20})"
-    )
-    for match in active.finditer(remaining):
-        tail = match.group("tail")
+    for match in re.finditer("凿", remaining):
+        tail = re.split(
+            r"[，。！？,!?；;\s]", remaining[match.end():], maxsplit=1,
+        )[0]
         changed = True
         while tail and changed:
             changed = False
@@ -932,6 +929,16 @@ def _has_action_on_other_object(text: str) -> bool:
                     tail = tail[len(prefix):]
                     changed = True
                     break
+        if not tail or tail.startswith((
+            "的", "得", "是", "很", "太", "真", "能", "可以", "用于", "作为",
+        )):
+            continue
+        left = remaining[max(0, match.start() - 1):match.start()]
+        if tail.startswith(("子", "刀", "头")) or (
+            left in {"铁", "钢", "石", "木"}
+            and tail.startswith(("工具", "品牌", "产品", "工艺"))
+        ):
+            continue
         if tail:
             return True
     ba_action = re.compile(r"(?:把|将)(?P<object>[^，。！？,!?；;]{1,20}?)(?:给)?凿")

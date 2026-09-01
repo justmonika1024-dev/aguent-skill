@@ -1827,6 +1827,53 @@ async def test_n13_default_thresholds_route_all_unqualified_back_to_n12():
 
 
 @pytest.mark.asyncio
+async def test_n13_rejects_other_action_objects_after_arbitrary_context_prefixes():
+    candidate_texts = {
+        "C1": "他拿锤子凿小王，又凿agu",
+        "C2": "群友昨晚在宿舍凿小李，随后凿agu",
+        "C3": "为了测试工具先凿木板，再凿agu",
+        "C4": "他们凿agu",
+        "C5": "拿锤子凿agu",
+        "C6": "agu被他们凿了",
+        "C7": "凿agu的结果很明显",
+    }
+    high_score = {
+        "fluency": 10,
+        "recognition": 10,
+        "agu_fit": 10,
+        "qualified": True,
+    }
+    llm = FakeLLMProvider(responses=[{
+        "scores": [
+            {**high_score, "candidate_id": candidate_id}
+            for candidate_id in candidate_texts
+        ],
+        "qualified_candidate_ids": list(candidate_texts),
+    }])
+    registry = build_real_registry(llm=llm, search=FakeSearchProvider())
+
+    result = await registry.get("N13").execute({
+        "N12": {"candidates": [
+            {"candidate_id": candidate_id, "text": text}
+            for candidate_id, text in candidate_texts.items()
+        ]},
+    }, None)
+
+    payload = result["artifact"]["llm"]
+    scores = {score["candidate_id"]: score for score in payload["scores"]}
+    assert result["outcome"] == "HAS_QUALIFIED"
+    assert payload["qualified_candidate_ids"] == ["C4", "C5", "C6", "C7"]
+    for candidate_id in ("C1", "C2", "C3"):
+        assert scores[candidate_id]["agu_fit"] < 6
+        assert scores[candidate_id]["qualified"] is False
+        assert "其他动作受事" in "".join(scores[candidate_id]["problems"])
+    for candidate_id in ("C4", "C5", "C6", "C7"):
+        assert scores[candidate_id]["agu_fit"] == 10
+        assert scores[candidate_id]["qualified"] is True
+        assert not scores[candidate_id]["problems"]
+
+
+@pytest.mark.asyncio
 async def test_n115_builds_fixed_catchphrase_blueprint_without_llm_json_failure():
     llm = FakeLLMProvider()
     registry = build_real_registry(llm=llm, search=FakeSearchProvider())
