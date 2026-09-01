@@ -131,7 +131,7 @@ def complete_evaluation_payload(expected_run_version: int, branch_id: str) -> di
             "overall_satisfaction": 4,
         },
         "main_problem_nodes": ["NO_OBVIOUS_PROBLEM"],
-        "admission": {"decision": "ADMIT"},
+        "admission": {"decision": "NOT_ADMIT"},
     }
 
 

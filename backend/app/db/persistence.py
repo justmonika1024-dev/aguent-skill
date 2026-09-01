@@ -433,6 +433,8 @@ class SQLiteRepository:
             "id": str(row.id),
             "title": str(row.title or ""),
             "original_meme_text": str(row.original_meme_text or ""),
+            "final_agu_text": str(row.final_agu_text or ""),
+            "source_run_id": str(row.source_run_id or ""),
         }
 
     async def archive_run(self, context: Any) -> None:

@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import re
 from difflib import SequenceMatcher
+from hashlib import sha256
+from math import isfinite
 from typing import Any
 
 from ..contracts.nodes import N12Output
@@ -53,7 +55,7 @@ _INSTRUCTIONS = {
     "N11": "验证N10模板能否覆盖原始梗和变式。输出 decision(PASS/REEXTRACT/MORE_EVIDENCE)、coverage、accuracy、problems。",
     "N11.5": "判断模板如何自然改写为凿agu。agu是人物，凿是作用于agu的动作；凿agu也可以整体名词化为标题、主语或宾语。实施方可按模板逻辑映射为研发方、发明方、创作者或组织者。输出 route、must_preserve、may_rewrite、rewrite_blueprint；route只能DIRECT_SLOT_FILL或STRUCTURE_PRESERVING_REWRITE。",
     "N12": "严格生成5条不同候选C1到C5。必须同时参考N10模板和N09中3至5条真实变式：变式只用于学习槽位替换方式、篇幅与克制度，不要归纳深层语义。agu始终是被凿的人；凿agu可作为完整事件短语进入标题、主语或宾语，正文无需机械重复动作。实施方可自然映射为研发方、发明方、创作者或组织者。至少一条采用最小替换，只改关键笑点并尽量保留原句其他部分；其他候选可选使用同济大学、高程群、群友、他或他们，不得强塞。输出route_used、candidates，每条含candidate_id、text、target_semantics、preserved_features、rewritten_features、slot_bindings、generation_approach。",
-    "N13": "对N12五条候选评分。输出scores数组，含candidate_id、fluency、recognition、agu_fit、humor、rhythm、adaptation_restraint、minimal_replacement_effect、qualified，并输出qualified_candidate_ids。优先奖励原梗辨识度、改编克制度和最小替换效果；不要因研发方、描述等所有槽位都强行解释凿而加分。",
+    "N13": "对N12五条候选按0到10分统一量表评分，默认最低合格分为6。输出scores数组，含candidate_id、fluency、recognition、agu_fit、humor、rhythm、adaptation_restraint、minimal_replacement_effect、problems、qualified，并输出qualified_candidate_ids。优先奖励原梗辨识度、改编克制度和最小替换效果；不要因研发方、描述等所有槽位都强行解释凿而加分。",
     "N14": "只从N13合格候选中选出一条，不得改写。输出selected_candidate_id、ranked_candidate_ids、selection_reason。",
     "N15": "生成正式梗包装。final_agu_text必须逐字等于N14选中的N12候选；输出title(4到40字)、normalized_title、final_agu_text、original、template、source_url。",
     "N19": (
@@ -87,15 +89,27 @@ _WORKFLOW_NODE_KEYS = {
     "N18", "N19", "N20",
 }
 
-_AUTO_ADMISSION_DIMENSION_THRESHOLDS = {
-    "fluency": 4,
-    "recognition": 4,
-    "agu_fit": 4,
-    "humor": 3,
-    "rhythm": 3,
-    "adaptation_restraint": 4,
-}
-_AUTO_ADMISSION_SCORE_THRESHOLD = 4.0
+_N13_ADMISSION_SCORE_FIELDS = (
+    "fluency",
+    "recognition",
+    "agu_fit",
+    "humor",
+    "rhythm",
+    "adaptation_restraint",
+    "minimal_replacement_effect",
+)
+_N13_CONFIGURABLE_THRESHOLDS = {"fluency", "recognition", "agu_fit"}
+_DEFAULT_N13_MINIMUM = 6.0
+_N11_ACCURACY_MINIMUM = 8.0
+_N11_COVERAGE_MINIMUM = 8.0
+_AUTO_ADMISSION_SCORE_THRESHOLD = 6.0
+_CONTENT_SAFETY_STATUSES = {"PASS", "REJECT", "UNCERTAIN"}
+_HIGH_RISK_CONTENT_PATTERNS = (
+    ("SELF_HARM_OR_SEVERE_VIOLENCE", re.compile(r"自杀|轻生|杀死|砍死|枪杀|灭口")),
+    ("SEXUAL_EXPLOITATION", re.compile(r"强奸|性侵|儿童色情|未成年.{0,4}色情")),
+    ("DANGEROUS_INSTRUCTIONS", re.compile(r"制造.{0,8}(?:炸弹|爆炸物|毒药)|投毒")),
+)
+_EXECUTABLE_PAYLOAD = re.compile(r"<script\b|javascript:|data:text/html", re.IGNORECASE)
 
 
 def _artifact_payload(value: dict[str, Any], node_key: str) -> dict[str, Any]:
@@ -103,6 +117,84 @@ def _artifact_payload(value: dict[str, Any], node_key: str) -> dict[str, Any]:
     if isinstance(payload, dict) and isinstance(payload.get("llm"), dict):
         payload = payload["llm"]
     return payload if isinstance(payload, dict) else {}
+
+
+def _bounded_number(value: Any, minimum: float, maximum: float) -> float | None:
+    if (not isinstance(value, (int, float)) or isinstance(value, bool)
+            or not isfinite(float(value))):
+        return None
+    number = float(value)
+    return number if minimum <= number <= maximum else None
+
+
+def _content_safety_status(payload: dict[str, Any]) -> tuple[str, bool]:
+    if "content_safety" in payload:
+        raw = payload["content_safety"]
+    elif "safety" in payload:
+        raw = payload["safety"]
+    else:
+        return "UNCERTAIN", False
+    if isinstance(raw, dict):
+        raw = raw.get("status", raw.get("result"))
+    status = str(raw or "UNCERTAIN").strip().upper()
+    if status not in _CONTENT_SAFETY_STATUSES:
+        status = "UNCERTAIN"
+    return status, True
+
+
+def _deterministic_content_safety(title: str, final_text: str) -> dict[str, Any]:
+    """Return an auditable, fail-closed local safety screening result."""
+    combined = f"{title}\n{final_text}".strip()
+    control_characters = sorted({
+        f"U+{ord(character):04X}"
+        for character in combined
+        if ord(character) < 32 and character not in "\n\r\t"
+    })
+    executable_matches = sorted(set(_EXECUTABLE_PAYLOAD.findall(combined)))
+    risk_matches = [
+        {"rule": rule, "matches": sorted(set(pattern.findall(combined)))}
+        for rule, pattern in _HIGH_RISK_CONTENT_PATTERNS
+        if pattern.search(combined)
+    ]
+    checks = [
+        {"rule": "NON_EMPTY_CONTENT", "passed": bool(combined)},
+        {
+            "rule": "NO_CONTROL_CHARACTERS",
+            "passed": not control_characters,
+            "matches": control_characters,
+        },
+        {
+            "rule": "NO_EXECUTABLE_PAYLOAD",
+            "passed": not executable_matches,
+            "matches": executable_matches,
+        },
+        {
+            "rule": "NO_HIGH_RISK_TERMS",
+            "passed": not risk_matches,
+            "matches": risk_matches,
+        },
+    ]
+    if not combined:
+        status = "UNCERTAIN"
+        reason = "标题和正式文案为空，无法完成确定性安全检查"
+    elif control_characters or executable_matches:
+        status = "REJECT"
+        reason = "确定性安全检查发现控制字符或可执行载荷"
+    elif risk_matches:
+        status = "UNCERTAIN"
+        reason = "确定性安全检查发现高风险词，需要人工安全复核"
+    else:
+        status = "PASS"
+        reason = "确定性安全规则全部通过"
+    return {
+        "status": status,
+        "method": "DETERMINISTIC_RULESET",
+        "policy_version": "content-safety-v1",
+        "checked_fields": ["title", "final_agu_text"],
+        "content_sha256": sha256(combined.encode("utf-8")).hexdigest(),
+        "checks": checks,
+        "reason": reason,
+    }
 
 
 def _automatic_admission_input(value: dict[str, Any]) -> dict[str, Any]:
@@ -113,47 +205,53 @@ def _automatic_admission_input(value: dict[str, Any]) -> dict[str, Any]:
     n14 = _artifact_payload(value, "N14")
     n15 = _artifact_payload(value, "N15")
 
-    selected_id = str(n14.get("selected_candidate_id", ""))
+    selected_id = str(n14.get("selected_candidate_id") or "").strip()
+    scores = n13.get("scores")
+    scores = scores if isinstance(scores, list) else []
     selected_score = next((
-        score for score in n13.get("scores", [])
+        score for score in scores
         if isinstance(score, dict) and str(score.get("candidate_id", "")) == selected_id
     ), {})
+    raw_qualified_ids = n13.get("qualified_candidate_ids")
     qualified_ids = {
-        str(candidate_id) for candidate_id in n13.get("qualified_candidate_ids", [])
-    }
-    final_text = str(n15.get("final_agu_text", ""))
-    action_affirmed = selected_score.get("action_affirmed")
-    if not isinstance(action_affirmed, bool):
-        action_affirmed = bool(
-            _ACTION_ON_AGU.search(final_text)
-            and not _has_action_on_other_object(final_text)
-        )
-    critical_failures = selected_score.get("critical_failures", [])
-    if isinstance(critical_failures, str):
-        critical_failures = [critical_failures]
-    elif not isinstance(critical_failures, list):
-        critical_failures = [str(critical_failures)] if critical_failures else []
+        str(candidate_id) for candidate_id in raw_qualified_ids
+    } if isinstance(raw_qualified_ids, list) else set()
+    final_text_value = n15.get("final_agu_text")
+    final_text = final_text_value.strip() if isinstance(final_text_value, str) else ""
+    safety, safety_present = _content_safety_status(n15)
 
-    dimension_scores: dict[str, float | None] = {}
-    for field in _AUTO_ADMISSION_DIMENSION_THRESHOLDS:
-        raw = selected_score.get(field)
-        dimension_scores[field] = (
-            float(raw)
-            if isinstance(raw, (int, float)) and not isinstance(raw, bool)
-            else None
-        )
-    complete_scores = [
-        score for score in dimension_scores.values() if score is not None
-    ]
-    candidate_average = (
-        sum(complete_scores) / len(_AUTO_ADMISSION_DIMENSION_THRESHOLDS)
-        if len(complete_scores) == len(_AUTO_ADMISSION_DIMENSION_THRESHOLDS)
-        else 0.0
+    n13_artifact = value.get("N13", {}) if isinstance(value, dict) else {}
+    raw_minimums = (
+        n13_artifact.get("minimum_thresholds", {})
+        if isinstance(n13_artifact, dict) else {}
     )
-    safety_value = n15.get("content_safety", n15.get("safety", "PASS"))
-    if isinstance(safety_value, dict):
-        safety_value = safety_value.get("status", safety_value.get("result", "PASS"))
-    safety = str(safety_value).upper()
+    raw_minimums = raw_minimums if isinstance(raw_minimums, dict) else {}
+    dimension_minimums: dict[str, float] = {}
+    dimension_scores: dict[str, float | None] = {}
+    for field in _N13_ADMISSION_SCORE_FIELDS:
+        configured = (
+            _bounded_number(raw_minimums.get(field), 0, 10)
+            if field in _N13_CONFIGURABLE_THRESHOLDS else None
+        )
+        dimension_minimums[field] = (
+            configured if configured is not None else _DEFAULT_N13_MINIMUM
+        )
+        dimension_scores[field] = _bounded_number(selected_score.get(field), 0, 10)
+
+    complete_scores = [score for score in dimension_scores.values() if score is not None]
+    candidate_average = (
+        sum(complete_scores) / len(_N13_ADMISSION_SCORE_FIELDS)
+        if len(complete_scores) == len(_N13_ADMISSION_SCORE_FIELDS) else None
+    )
+    accuracy_raw = _bounded_number(n11.get("accuracy"), 1, 5)
+    coverage_raw = _bounded_number(n11.get("coverage"), 0, 1)
+    accuracy_score = accuracy_raw * 2 if accuracy_raw is not None else None
+    coverage_score = coverage_raw * 10 if coverage_raw is not None else None
+    aggregate_components = [accuracy_score, coverage_score, candidate_average]
+    quality_score = (
+        sum(component for component in aggregate_components if component is not None) / 3
+        if all(component is not None for component in aggregate_components) else 0.0
+    )
 
     failures: list[tuple[str, str]] = []
 
@@ -164,68 +262,106 @@ def _automatic_admission_input(value: dict[str, Any]) -> dict[str, Any]:
         fail("N09_NOT_SUFFICIENT", "N09变式证据不充分")
     if n11.get("decision") != "PASS":
         fail("N11_NOT_PASS", "N11模板校验未通过")
-    accuracy = n11.get("accuracy")
-    if not isinstance(accuracy, (int, float)) or isinstance(accuracy, bool) or accuracy < 4:
-        fail("N11_ACCURACY_BELOW_4", f"模板准确度{accuracy}/5低于4")
-    coverage = n11.get("coverage")
-    if (not isinstance(coverage, (int, float)) or isinstance(coverage, bool)
-            or coverage < 0.8):
-        rendered_coverage = f"{coverage:.0%}" if isinstance(coverage, (int, float)) else str(coverage)
-        fail("N11_COVERAGE_BELOW_0_8", f"模板覆盖率{rendered_coverage}低于80%")
-    if n11_5.get("route") == "ABANDON_ORIGINAL" or not n11_5.get("route"):
+    if accuracy_score is None:
+        fail("N11_ACCURACY_INVALID", "N11模板准确度缺失或不在1-5量表内")
+    elif accuracy_score < _N11_ACCURACY_MINIMUM:
+        fail(
+            "N11_ACCURACY_BELOW_8",
+            f"N11模板准确度归一分{accuracy_score:.2f}/10低于8.00/10",
+        )
+    if coverage_score is None:
+        fail("N11_COVERAGE_INVALID", "N11模板覆盖率缺失或不在0-1量表内")
+    elif coverage_score < _N11_COVERAGE_MINIMUM:
+        fail(
+            "N11_COVERAGE_BELOW_8",
+            f"N11模板覆盖率归一分{coverage_score:.2f}/10低于8.00/10",
+        )
+    route = n11_5.get("route")
+    if route not in {"DIRECT_SLOT_FILL", "STRUCTURE_PRESERVING_REWRITE"}:
         fail("N11_5_ABANDONED", "N11.5未产出可用改写路由")
+    if not selected_id:
+        fail("N14_SELECTED_ID_MISSING", "N14缺少最终候选ID")
+    if not isinstance(n13.get("scores"), list):
+        fail("N13_SCORES_MISSING", "N13缺少正式scores数组")
+    if not isinstance(raw_qualified_ids, list):
+        fail("N13_QUALIFIED_IDS_MISSING", "N13缺少qualified_candidate_ids数组")
     if not selected_score:
         fail("N13_SELECTED_SCORE_MISSING", f"N13缺少最终候选{selected_id or 'UNKNOWN'}的评分")
-    elif not selected_score.get("qualified") or selected_id not in qualified_ids:
+    elif selected_score.get("qualified") is not True or selected_id not in qualified_ids:
         fail("N13_SELECTED_NOT_QUALIFIED", f"最终候选{selected_id}未通过N13合格门槛")
-    if not action_affirmed:
-        fail("N13_ACTION_NOT_AFFIRMED", f"最终候选{selected_id or 'UNKNOWN'}未确认凿agu动作")
-    if critical_failures:
-        fail("N13_CRITICAL_FAILURES", "N13存在严重失败：" + "、".join(map(str, critical_failures)))
-    for field, minimum in _AUTO_ADMISSION_DIMENSION_THRESHOLDS.items():
-        score = dimension_scores[field]
-        if score is None or score < minimum:
-            fail(
-                f"N13_{field.upper()}_BELOW_{minimum}",
-                f"最终候选{field}得分{score}低于{minimum}",
-            )
-    if candidate_average < _AUTO_ADMISSION_SCORE_THRESHOLD:
+    raw_problems = selected_score.get("problems") if selected_score else None
+    if selected_score and not isinstance(raw_problems, list):
+        fail("N13_PROBLEMS_MISSING", f"最终候选{selected_id}缺少problems数组")
+        candidate_problems: list[str] = []
+    else:
+        candidate_problems = [
+            str(problem).strip() for problem in (raw_problems or [])
+            if str(problem).strip()
+        ]
+    if candidate_problems:
         fail(
-            "N13_AVERAGE_BELOW_4",
-            f"最终候选六维均分{candidate_average:.2f}低于4.00",
+            "N13_SELECTED_HAS_PROBLEMS",
+            f"最终候选{selected_id}仍有问题：" + "、".join(candidate_problems),
+        )
+    for field in _N13_ADMISSION_SCORE_FIELDS:
+        score = dimension_scores[field]
+        minimum = dimension_minimums[field]
+        if field not in selected_score:
+            fail(f"N13_{field.upper()}_MISSING", f"最终候选缺少{field}评分")
+        elif score is None:
+            fail(
+                f"N13_{field.upper()}_INVALID",
+                f"最终候选{field}评分不在0-10量表内",
+            )
+        elif score < minimum:
+            fail(
+                f"N13_{field.upper()}_BELOW_{minimum:g}",
+                f"最终候选{field}得分{score:.2f}/10低于{minimum:.2f}/10",
+            )
+    if (candidate_average is not None
+            and quality_score < _AUTO_ADMISSION_SCORE_THRESHOLD):
+        fail(
+            "ADMISSION_SCORE_BELOW_6",
+            f"统一量表综合质量分{quality_score:.2f}/10低于6.00/10",
         )
     if not final_text:
         fail("N15_FINAL_TEXT_MISSING", "N15正式文案为空")
-    if safety != "PASS":
+    elif not _ACTION_ON_AGU.search(final_text) or _has_action_on_other_object(final_text):
+        fail("N15_ACTION_INVALID", "N15正式文案未满足凿agu动作受事硬约束")
+    if not safety_present:
+        fail("CONTENT_SAFETY_MISSING", "N15缺少可审计内容安全结果，按UNCERTAIN处理")
+    elif safety != "PASS":
         fail("CONTENT_SAFETY_NOT_PASS", f"内容安全结果为{safety}")
 
-    quality_failures = [
-        item for item in failures if item[0] != "CONTENT_SAFETY_NOT_PASS"
-    ]
-    score = candidate_average if not quality_failures else 0.0
     if failures:
         decision_basis = "自动准入未通过：" + "；".join(message for _, message in failures)
     else:
         decision_basis = (
-            f"自动准入通过：模板准确度{accuracy}/5、覆盖率{coverage:.0%}；"
-            f"最终候选{selected_id}六维均分{candidate_average:.2f}，全部硬条件满足。"
+            f"自动准入通过：N11准确度{accuracy_score:.2f}/10、"
+            f"覆盖率{coverage_score:.2f}/10；最终候选{selected_id}"
+            f"七维均分{candidate_average:.2f}/10，综合质量分{quality_score:.2f}/10，"
+            "全部硬条件满足。"
         )
     return {
-        "score": score,
+        "score": quality_score,
         "threshold": _AUTO_ADMISSION_SCORE_THRESHOLD,
         "safety": safety,
+        "content_safety": n15.get("content_safety", n15.get("safety")),
         "selected_candidate_id": selected_id,
         "quality_components": {
+            "scale": "0-10",
             "n09_is_sufficient": n09.get("is_sufficient"),
             "template_decision": n11.get("decision"),
-            "template_accuracy": accuracy,
-            "template_coverage": coverage,
-            "route": n11_5.get("route"),
+            "template_accuracy_raw_1_to_5": accuracy_raw,
+            "template_accuracy": accuracy_score,
+            "template_coverage_raw_0_to_1": coverage_raw,
+            "template_coverage": coverage_score,
+            "route": route,
             "candidate_scores": dimension_scores,
+            "candidate_minimums": dimension_minimums,
             "candidate_average": candidate_average,
             "candidate_qualified": selected_score.get("qualified"),
-            "action_affirmed": action_affirmed,
-            "critical_failures": critical_failures,
+            "candidate_problems": candidate_problems,
             "final_text_present": bool(final_text),
         },
         "failed_conditions": [code for code, _ in failures],
@@ -744,6 +880,91 @@ def _duplicate_similarity(left: str, right: str) -> float:
     ):
         return 1.0
     return SequenceMatcher(None, left_normalized, right_normalized).ratio()
+
+
+async def _final_formal_duplicate_check(
+    value: dict[str, Any], repository: Any, run_id: str,
+) -> tuple[str, dict[str, Any]]:
+    n15 = _artifact_payload(value, "N15")
+    title = str(n15.get("title") or "").strip()
+    normalized_title = str(n15.get("normalized_title") or title).strip()
+    final_text = str(n15.get("final_agu_text") or "").strip()
+    if not title or not final_text:
+        return "HUMAN_REVIEW_REQUIRED", {
+            "checked_formal_title_count": 0,
+            "suspected_titles": [],
+            "rejection_reason": "N15_FORMAL_DRAFT_INCOMPLETE",
+        }
+    if (repository is None
+            or not hasattr(repository, "list_formal_meme_titles")
+            or not hasattr(repository, "get_formal_meme_summary")):
+        return "HUMAN_REVIEW_REQUIRED", {
+            "checked_formal_title_count": 0,
+            "suspected_titles": [],
+            "rejection_reason": "FORMAL_MEME_REPOSITORY_UNAVAILABLE",
+        }
+    try:
+        formal_titles = await repository.list_formal_meme_titles()
+        if not isinstance(formal_titles, list):
+            raise TypeError("formal title lookup did not return a list")
+        suspected_titles: list[dict[str, Any]] = []
+        checked_detail_count = 0
+        for item in formal_titles:
+            if not isinstance(item, dict):
+                continue
+            meme_id = str(item.get("id") or "")
+            if not meme_id:
+                continue
+            detail = await repository.get_formal_meme_summary(meme_id)
+            if not isinstance(detail, dict):
+                continue
+            if run_id != "unknown" and str(detail.get("source_run_id") or "") == run_id:
+                continue
+            checked_detail_count += 1
+            existing_title = str(detail.get("title") or item.get("title") or "")
+            existing_text = str(detail.get("final_agu_text") or "")
+            title_similarity = max(
+                _duplicate_similarity(title, existing_title),
+                _duplicate_similarity(normalized_title, existing_title),
+            )
+            content_similarity = _duplicate_similarity(final_text, existing_text)
+            if max(title_similarity, content_similarity) >= 0.72:
+                suspected_titles.append({
+                    "id": meme_id,
+                    "title": existing_title,
+                    "title_similarity": title_similarity,
+                    "content_similarity": content_similarity,
+                })
+            if title_similarity >= 0.88 or content_similarity >= 0.88:
+                duplicate_basis = (
+                    "TITLE_AND_CONTENT"
+                    if title_similarity >= 0.88 and content_similarity >= 0.88
+                    else "TITLE" if title_similarity >= 0.88 else "CONTENT"
+                )
+                return "DUPLICATE", {
+                    "checked_formal_title_count": len(formal_titles),
+                    "checked_formal_detail_count": checked_detail_count,
+                    "suspected_titles": suspected_titles,
+                    "suspected_meme_id": meme_id,
+                    "existing_title": existing_title,
+                    "existing_final_agu_text": existing_text,
+                    "title_similarity": title_similarity,
+                    "content_similarity": content_similarity,
+                    "duplicate_similarity": max(title_similarity, content_similarity),
+                    "duplicate_basis": duplicate_basis,
+                }
+        return "NOT_DUPLICATE", {
+            "checked_formal_title_count": len(formal_titles),
+            "checked_formal_detail_count": checked_detail_count,
+            "suspected_titles": suspected_titles,
+        }
+    except Exception as exc:
+        return "HUMAN_REVIEW_REQUIRED", {
+            "checked_formal_title_count": 0,
+            "suspected_titles": [],
+            "rejection_reason": "FORMAL_MEME_LOOKUP_FAILED",
+            "error_type": type(exc).__name__,
+        }
 
 
 def _template_pattern(template: str) -> re.Pattern[str]:
@@ -1301,9 +1522,20 @@ class RealWorkflowNode:
                 "suspected_titles": suspected,
             }}
         if self.key == "N16" and isinstance(value, dict):
+            duplicate_outcome, duplicate_artifact = await _final_formal_duplicate_check(
+                value, self.repository, str(run_id),
+            )
+            if duplicate_outcome != "NOT_DUPLICATE":
+                return {
+                    "outcome": duplicate_outcome,
+                    "artifact": duplicate_artifact,
+                }
             return {
                 "outcome": "NOT_DUPLICATE",
-                "artifact": _automatic_admission_input(value),
+                "artifact": {
+                    **duplicate_artifact,
+                    **_automatic_admission_input(value),
+                },
             }
         if self.key not in _LLM_NODES:
             return {"outcome": self.outcome, "artifact": {"node_key": self.key, "input_node_keys": list(value) if isinstance(value, dict) else []}}
@@ -1765,6 +1997,9 @@ class RealWorkflowNode:
             }
             if not parsed["original"] or not parsed["template"]:
                 raise ValueError("N15 cannot package an empty original meme or template")
+            parsed["content_safety"] = _deterministic_content_safety(
+                title, str(selected["text"]),
+            )
             return {"outcome": self.outcome, "artifact": {"llm": parsed, "packaging_mode": "DETERMINISTIC_FROM_N14"}}
         if self.llm is None:
             raise RuntimeError("llm provider is not configured")
@@ -1817,6 +2052,11 @@ class RealWorkflowNode:
                 "do_not_reward_explaining_every_slot": True,
                 "directives": applied_evaluation_directives,
                 "minimum_thresholds": dict(n13_thresholds),
+                "score_scale": {
+                    "minimum": 0,
+                    "maximum": 10,
+                    "default_minimum": 6,
+                },
             }
         exhausted_originals = (
             _runtime_exhausted_originals(services) if self.key == "N02" else []

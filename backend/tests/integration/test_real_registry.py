@@ -37,6 +37,8 @@ class FormalMemeRepositoryStub:
             "id": meme_id,
             "title": "凿agu版·小孩才做选择，我全都要是什么梗",
             "original_meme_text": "小孩才做选择，我全都要",
+            "final_agu_text": "小孩才做选择，agu全都要凿",
+            "source_run_id": "existing-run",
         }
 
     async def record_api_call(self, *args, **kwargs):
@@ -51,22 +53,30 @@ class UsageRepositoryStub:
         self.api_calls.append({"args": args, "kwargs": kwargs})
 
 
+class EmptyFormalMemeRepositoryStub:
+    async def list_formal_meme_titles(self):
+        return []
+
+    async def get_formal_meme_summary(self, meme_id):
+        raise AssertionError(f"unexpected formal meme detail request: {meme_id}")
+
+
 def automatic_admission_artifacts(
-    *, template_accuracy: int = 5, safety: str = "PASS",
+    *, template_accuracy: int = 5, safety: str | None = "PASS",
 ) -> dict:
     selected_score = {
         "candidate_id": "C1",
-        "fluency": 5,
-        "recognition": 5,
-        "agu_fit": 5,
-        "humor": 4,
-        "rhythm": 4,
-        "adaptation_restraint": 5,
+        "fluency": 8,
+        "recognition": 9,
+        "agu_fit": 9,
+        "humor": 7,
+        "rhythm": 7,
+        "adaptation_restraint": 8,
+        "minimal_replacement_effect": 8,
         "qualified": True,
-        "action_affirmed": True,
-        "critical_failures": [],
+        "problems": [],
     }
-    return {
+    artifacts = {
         "N09": {"llm": {"is_sufficient": True, "variants": [{}, {}, {}]}},
         "N11": {"llm": {
             "decision": "PASS", "accuracy": template_accuracy, "coverage": 0.9,
@@ -74,17 +84,32 @@ def automatic_admission_artifacts(
         "N11.5": {"llm": {"route": "STRUCTURE_PRESERVING_REWRITE"}},
         "N13": {"llm": {
             "scores": [selected_score], "qualified_candidate_ids": ["C1"],
+        }, "minimum_thresholds": {
+            "fluency": 6, "recognition": 6, "agu_fit": 6,
         }},
         "N14": {"llm": {"selected_candidate_id": "C1"}},
         "N15": {"llm": {
-            "final_agu_text": "他正在凿agu。", "content_safety": safety,
+            "title": "凿agu版·新梗",
+            "normalized_title": "凿agu版·新梗",
+            "final_agu_text": "他正在凿agu。",
         }},
     }
+    if safety is not None:
+        artifacts["N15"]["llm"]["content_safety"] = {
+            "status": safety,
+            "method": "DETERMINISTIC_RULESET",
+            "policy_version": "content-safety-v1",
+            "checks": [],
+        }
+    return artifacts
 
 
 @pytest.mark.asyncio
 async def test_real_registry_n16_and_n17_admit_high_quality_artifacts():
-    registry = build_real_registry(llm=FakeLLMProvider(), search=FakeSearchProvider())
+    registry = build_real_registry(
+        llm=FakeLLMProvider(), search=FakeSearchProvider(),
+        repository=EmptyFormalMemeRepositoryStub(),
+    )
 
     n16 = await registry.get("N16").execute(automatic_admission_artifacts(), None)
     n17 = await registry.get("N17").execute(
@@ -92,11 +117,14 @@ async def test_real_registry_n16_and_n17_admit_high_quality_artifacts():
     )
 
     assert n16["outcome"] == "NOT_DUPLICATE"
-    assert n16["artifact"]["score"] == pytest.approx(14 / 3)
-    assert n16["artifact"]["threshold"] == 4.0
+    assert n16["artifact"]["checked_formal_title_count"] == 0
+    assert n16["artifact"]["score"] == pytest.approx(9.0)
+    assert n16["artifact"]["threshold"] == 6.0
     assert n16["artifact"]["failed_conditions"] == []
-    assert "模板准确度5/5" in n16["artifact"]["decision_basis"]
-    assert "六维均分4.67" in n16["artifact"]["decision_basis"]
+    assert n16["artifact"]["quality_components"]["scale"] == "0-10"
+    assert n16["artifact"]["quality_components"]["template_accuracy"] == 10.0
+    assert n16["artifact"]["quality_components"]["template_coverage"] == 9.0
+    assert "综合质量分9.00/10" in n16["artifact"]["decision_basis"]
     assert n17.outcome == "AUTO_DECIDED"
     assert n17.output["admission_decision"] == "ADMIT"
     assert n17.output["reason"] == n16["artifact"]["decision_basis"]
@@ -104,26 +132,91 @@ async def test_real_registry_n16_and_n17_admit_high_quality_artifacts():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("artifacts", "failed_condition", "safety"), [
-    (automatic_admission_artifacts(template_accuracy=3), "N11_ACCURACY_BELOW_4", "PASS"),
-    (automatic_admission_artifacts(safety="REJECT"), None, "REJECT"),
+    (automatic_admission_artifacts(template_accuracy=3), "N11_ACCURACY_BELOW_8", "PASS"),
+    (automatic_admission_artifacts(safety=None), "CONTENT_SAFETY_MISSING", "UNCERTAIN"),
+    (automatic_admission_artifacts(safety="UNCERTAIN"), "CONTENT_SAFETY_NOT_PASS", "UNCERTAIN"),
+    (automatic_admission_artifacts(safety="REJECT"), "CONTENT_SAFETY_NOT_PASS", "REJECT"),
 ])
 async def test_real_registry_n16_and_n17_reject_low_quality_or_unsafe_artifacts(
     artifacts, failed_condition, safety,
 ):
-    registry = build_real_registry(llm=FakeLLMProvider(), search=FakeSearchProvider())
+    registry = build_real_registry(
+        llm=FakeLLMProvider(), search=FakeSearchProvider(),
+        repository=EmptyFormalMemeRepositoryStub(),
+    )
 
     n16 = await registry.get("N16").execute(artifacts, None)
     n17 = await registry.get("N17").execute(
         {"N16": n16["artifact"]}, {"admission_mode": "AUTO"},
     )
 
-    if failed_condition is not None:
-        assert failed_condition in n16["artifact"]["failed_conditions"]
-        assert "模板准确度3/5低于4" in n16["artifact"]["decision_basis"]
+    assert failed_condition in n16["artifact"]["failed_conditions"]
     assert n16["artifact"]["safety"] == safety
     assert n17.outcome == "AUTO_DECIDED"
     assert n17.output["admission_decision"] == "NOT_ADMIT"
     assert n17.output["reason"]
+
+
+@pytest.mark.asyncio
+async def test_real_registry_n16_rejects_duplicate_formal_title_before_admission():
+    repository = FormalMemeRepositoryStub()
+    registry = build_real_registry(
+        llm=FakeLLMProvider(), search=FakeSearchProvider(), repository=repository,
+    )
+    artifacts = automatic_admission_artifacts()
+    artifacts["N15"]["llm"].update({
+        "title": "凿agu版·小孩才做选择，我全都要是什么梗",
+        "normalized_title": "凿agu版·小孩才做选择，我全都要是什么梗",
+    })
+
+    n16 = await registry.get("N16").execute(
+        artifacts, {"run_id": "new-run"},
+    )
+
+    assert n16["outcome"] == "DUPLICATE"
+    assert n16["artifact"]["suspected_meme_id"] == "existing-1"
+    assert n16["artifact"]["existing_title"].startswith("凿agu版")
+    assert n16["artifact"]["duplicate_basis"] == "TITLE"
+    assert "score" not in n16["artifact"]
+
+
+@pytest.mark.asyncio
+async def test_real_registry_n16_fails_closed_when_selected_score_contract_is_incomplete():
+    registry = build_real_registry(
+        llm=FakeLLMProvider(), search=FakeSearchProvider(),
+        repository=EmptyFormalMemeRepositoryStub(),
+    )
+    artifacts = automatic_admission_artifacts()
+    del artifacts["N13"]["llm"]["scores"][0]["humor"]
+
+    n16 = await registry.get("N16").execute(artifacts, None)
+    n17 = await registry.get("N17").execute(
+        {"N16": n16["artifact"]}, {"admission_mode": "AUTO"},
+    )
+
+    assert "N13_HUMOR_MISSING" in n16["artifact"]["failed_conditions"]
+    assert "缺少humor评分" in n16["artifact"]["decision_basis"]
+    assert n17.output["admission_decision"] == "NOT_ADMIT"
+
+
+@pytest.mark.asyncio
+async def test_real_registry_n17_rejects_quality_score_outside_zero_to_ten_scale():
+    registry = build_real_registry(
+        llm=FakeLLMProvider(), search=FakeSearchProvider(),
+        repository=EmptyFormalMemeRepositoryStub(),
+    )
+
+    n17 = await registry.get("N17").execute({
+        "N16": {
+            "score": 11,
+            "threshold": 6,
+            "safety": "PASS",
+            "failed_conditions": [],
+        },
+    }, {"admission_mode": "AUTO"})
+
+    assert n17.output["admission_decision"] == "NOT_ADMIT"
+    assert "0-10" in n17.output["reason"]
 
 
 def test_low_variant_scores_force_search_quality_patch():
@@ -1807,6 +1900,9 @@ async def test_n13_injects_and_audits_evaluation_strategy_directives():
     assert priorities["minimum_thresholds"] == {
         "fluency": 7, "recognition": 8, "agu_fit": 9,
     }
+    assert priorities["score_scale"] == {
+        "minimum": 0, "maximum": 10, "default_minimum": 6,
+    }
     assert result["artifact"]["applied_evaluation_directives"] == [
         "优先检查指示结构", "核对动作受事",
     ]
@@ -2234,6 +2330,11 @@ async def test_n15_packages_exact_selected_candidate_without_another_llm_call():
     assert payload["final_agu_text"] == selected_text
     assert payload["original"] == "原始梗"
     assert payload["template"] == "模板"
+    assert payload["content_safety"]["status"] == "PASS"
+    assert payload["content_safety"]["method"] == "DETERMINISTIC_RULESET"
+    assert payload["content_safety"]["policy_version"] == "content-safety-v1"
+    assert payload["content_safety"]["checked_fields"] == ["title", "final_agu_text"]
+    assert all(check["passed"] for check in payload["content_safety"]["checks"])
     assert llm.requests == []
 
 

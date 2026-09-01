@@ -7,7 +7,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 
-from app.db.models import RunHumanEvaluation, RunStrategyPatch
+from app.db.models import MemeRecord, RunHumanEvaluation, RunStrategyPatch
 from app.db.persistence import SQLiteRepository
 from app.main import app
 from app.providers.fake import FakeLLMProvider, FakeSearchProvider
@@ -17,21 +17,23 @@ from app.workflow.events import EventBus
 from app.workflow.real_registry import build_real_registry
 
 
-def automatic_admission_artifacts(automatic_decision: str) -> dict:
+def automatic_admission_artifacts(
+    automatic_decision: str, *, safety: str | None = "PASS",
+) -> dict:
     accuracy = 5 if automatic_decision == "ADMIT" else 3
     selected_score = {
         "candidate_id": "C1",
-        "fluency": 5,
-        "recognition": 5,
-        "agu_fit": 5,
-        "humor": 4,
-        "rhythm": 4,
-        "adaptation_restraint": 5,
+        "fluency": 8,
+        "recognition": 9,
+        "agu_fit": 9,
+        "humor": 7,
+        "rhythm": 7,
+        "adaptation_restraint": 8,
+        "minimal_replacement_effect": 8,
         "qualified": True,
-        "action_affirmed": True,
-        "critical_failures": [],
+        "problems": [],
     }
-    return {
+    artifacts = {
         "N09": {"llm": {"is_sufficient": True, "variants": [{}, {}, {}]}},
         "N11": {"llm": {
             "decision": "PASS", "accuracy": accuracy, "coverage": 0.9,
@@ -39,12 +41,24 @@ def automatic_admission_artifacts(automatic_decision: str) -> dict:
         "N11.5": {"llm": {"route": "STRUCTURE_PRESERVING_REWRITE"}},
         "N13": {"llm": {
             "scores": [selected_score], "qualified_candidate_ids": ["C1"],
+        }, "minimum_thresholds": {
+            "fluency": 6, "recognition": 6, "agu_fit": 6,
         }},
         "N14": {"llm": {"selected_candidate_id": "C1"}},
         "N15": {"llm": {
-            "final_agu_text": "他正在凿agu。", "content_safety": "PASS",
+            "title": "凿agu版·新梗",
+            "normalized_title": "凿agu版·新梗",
+            "final_agu_text": "他正在凿agu。",
         }},
     }
+    if safety is not None:
+        artifacts["N15"]["llm"]["content_safety"] = {
+            "status": safety,
+            "method": "DETERMINISTIC_RULESET",
+            "policy_version": "content-safety-v1",
+            "checks": [],
+        }
+    return artifacts
 
 
 def modular_evaluation_payload(expected_run_version: int, branch_id: str) -> dict:
@@ -106,7 +120,7 @@ def modular_evaluation_payload(expected_run_version: int, branch_id: str) -> dic
             "overall_satisfaction": 4,
         },
         "main_problem_nodes": ["NO_OBVIOUS_PROBLEM"],
-        "admission": {"decision": "ADMIT"},
+        "admission": {"decision": "NOT_ADMIT"},
     }
 
 
@@ -200,7 +214,7 @@ async def test_modular_evaluation_api_validates_persists_and_reuses_evaluation_i
         payload = modular_evaluation_payload(
             snapshot["run_version"], snapshot["active_branch_id"],
         )
-        payload["admission"]["reason"] = "人工确认质量达标"
+        payload["admission"]["reason"] = "默认节点没有安全结果，不入库"
         payload["overall_comment"] = "七模块整体可用"
         submitted = await client.post(
             f"/api/v1/runs/{run_id}/evaluation",
@@ -223,9 +237,9 @@ async def test_modular_evaluation_api_validates_persists_and_reuses_evaluation_i
     assert evaluation["variant_search_results"]["comment"] == ""
     assert evaluation["candidate_generation"]["candidates"]["C5"]["usability"] == "USABLE"
     assert evaluation["admission"] == {
-        "decision": "ADMIT",
+        "decision": "NOT_ADMIT",
         "override": None,
-        "reason": "人工确认质量达标",
+        "reason": "默认节点没有安全结果，不入库",
     }
     assert evaluation["overall_comment"] == "七模块整体可用"
     assert patch is not None
@@ -287,6 +301,19 @@ async def test_modular_evaluation_auto_override_persists_resolved_decision_and_f
     engine.contexts[context.run_id] = context
     engine.buses[context.run_id] = EventBus()
     await repository.create_run(context)
+    prior_outcomes = {
+        "N13": "HAS_QUALIFIED", "N14": "SELECTED", "N15": "DRAFT_READY",
+    }
+    persisted_at = datetime.now(UTC)
+    for node_key, outcome in prior_outcomes.items():
+        await repository.persist_node(
+            context,
+            node_key,
+            context.active_artifacts[node_key],
+            outcome,
+            started_at=persisted_at,
+            ended_at=persisted_at,
+        )
     engine._tasks[context.run_id] = asyncio.create_task(engine._run(context))
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -298,7 +325,7 @@ async def test_modular_evaluation_auto_override_persists_resolved_decision_and_f
             await asyncio.sleep(0.005)
         assert snapshot["state"] == "WAITING_HUMAN_EVALUATION"
         assert engine.contexts[run_id].node_outputs["N16"]["failed_conditions"] == (
-            [] if automatic_decision == "ADMIT" else ["N11_ACCURACY_BELOW_4"]
+            [] if automatic_decision == "ADMIT" else ["N11_ACCURACY_BELOW_8"]
         )
         assert engine.contexts[run_id].node_outputs["N17"][
             "admission_decision"
@@ -315,7 +342,10 @@ async def test_modular_evaluation_auto_override_persists_resolved_decision_and_f
         for _ in range(400):
             record = (await client.get(f"/api/v1/runs/{run_id}/record")).json()
             if (record["evaluations"]
-                    and record["run"]["admission_decision"] == expected_decision):
+                    and record["run"]["admission_decision"] == expected_decision
+                    and record["run"]["state"] == "COMPLETED"
+                    and (expected_decision != "ADMIT"
+                         or record["run"]["formal_meme_id"])):
                 break
             await asyncio.sleep(0.005)
 
@@ -332,6 +362,78 @@ async def test_modular_evaluation_auto_override_persists_resolved_decision_and_f
         node for node in record["nodes"] if node["node_key"] == "N17"
     )
     assert persisted_n17["output"]["admission_decision"] == automatic_decision
+    persisted_n13 = next(
+        node for node in record["nodes"] if node["node_key"] == "N13"
+    )
+    persisted_score = persisted_n13["output"]["llm"]["scores"][0]
+    assert "action_affirmed" not in persisted_score
+    assert "critical_failures" not in persisted_score
+    assert persisted_score["problems"] == []
+    async with repository.session() as session:
+        formal_records = (await session.execute(select(MemeRecord))).scalars().all()
+    await repository.engine.dispose()
+    assert len(formal_records) == (1 if expected_decision == "ADMIT" else 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("admission_mode", "admission", "safety"), [
+    (AdmissionMode.HUMAN, {"decision": "ADMIT"}, None),
+    (AdmissionMode.HUMAN, {"decision": "ADMIT"}, "UNCERTAIN"),
+    (AdmissionMode.HUMAN, {"decision": "ADMIT"}, "REJECT"),
+    (AdmissionMode.AUTO, {"override": "OVERRIDE_TO_ADMIT"}, None),
+    (AdmissionMode.AUTO, {"override": "OVERRIDE_TO_ADMIT"}, "UNCERTAIN"),
+    (AdmissionMode.AUTO, {"override": "OVERRIDE_TO_ADMIT"}, "REJECT"),
+])
+async def test_modular_evaluation_cannot_force_admission_without_passed_safety(
+    admission_mode, admission, safety, tmp_path, monkeypatch,
+):
+    repository = SQLiteRepository(
+        f"sqlite+aiosqlite:///{tmp_path / f'safety-{admission_mode}-{safety}.db'}",
+    )
+    engine = WorkflowEngine(repository=repository)
+    context = RunContext(
+        mode=RunMode.AUTO_DISCOVERY,
+        admission_mode=admission_mode,
+        current_node="N18",
+        current_state=RunState.WAITING_HUMAN_EVALUATION,
+    )
+    n16 = {"failed_conditions": [], "decision_basis": "安全裁定测试"}
+    if safety is not None:
+        n16["safety"] = safety
+    context.active_artifacts["N16"] = n16
+    context.node_outputs["N16"] = n16
+    if admission_mode is AdmissionMode.AUTO:
+        n17 = {
+            "admission_decision": "NOT_ADMIT",
+            "reason": "内容安全未通过",
+            "safety": safety or "UNCERTAIN",
+        }
+        context.active_artifacts["N17"] = n17
+        context.node_outputs["N17"] = n17
+    engine.contexts[context.run_id] = context
+    engine.buses[context.run_id] = EventBus()
+    await repository.create_run(context)
+    api_router = importlib.import_module("app.api.router")
+    monkeypatch.setattr(api_router, "_engine", engine)
+    payload = modular_evaluation_payload(
+        context.run_version, context.active_branch_id,
+    )
+    payload["admission"] = admission
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            f"/api/v1/runs/{context.run_id}/evaluation", json=payload,
+        )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "CONTENT_SAFETY_NOT_PASS"
+    assert (safety or "UNCERTAIN") in response.json()["error"]["message"]
+    async with repository.session() as session:
+        evaluations = (await session.execute(select(RunHumanEvaluation))).scalars().all()
+        formal_records = (await session.execute(select(MemeRecord))).scalars().all()
+    await repository.engine.dispose()
+    assert evaluations == []
+    assert formal_records == []
 
 
 @pytest.mark.asyncio

@@ -76,6 +76,23 @@ def _automatic_admission_decision(context: Any) -> str | None:
     return None
 
 
+def _n16_safety_status(context: Any) -> str:
+    for artifacts in (context.active_artifacts, context.node_outputs):
+        value = artifacts.get("N16")
+        if value is None:
+            continue
+        if isinstance(value, dict) and isinstance(value.get("llm"), dict):
+            value = value["llm"]
+        if not isinstance(value, dict):
+            return "UNCERTAIN"
+        safety: Any = value.get("safety", value.get("content_safety"))
+        if isinstance(safety, dict):
+            safety = safety.get("status", safety.get("result"))
+        status = str(safety or "UNCERTAIN").strip().upper()
+        return status if status in {"PASS", "REJECT", "UNCERTAIN"} else "UNCERTAIN"
+    return "UNCERTAIN"
+
+
 def _resolve_admission(context: Any, admission: dict[str, Any]) -> str:
     decision = admission.get("decision")
     override = admission.get("override")
@@ -85,25 +102,35 @@ def _resolve_admission(context: Any, admission: dict[str, Any]) -> str:
                 "code": "INVALID_ADMISSION",
                 "message": "HUMAN admission requires decision and forbids override",
             })
-        return str(decision)
-    if decision is not None or override not in {
-        "KEEP", "OVERRIDE_TO_ADMIT", "OVERRIDE_TO_NOT_ADMIT",
-    }:
-        raise HTTPException(422, detail={
-            "code": "INVALID_ADMISSION",
-            "message": "AUTO admission requires override and forbids decision",
-        })
-    if override == "OVERRIDE_TO_ADMIT":
-        return "ADMIT"
-    if override == "OVERRIDE_TO_NOT_ADMIT":
-        return "NOT_ADMIT"
-    automatic_decision = _automatic_admission_decision(context)
-    if automatic_decision is None:
-        raise HTTPException(422, detail={
-            "code": "INVALID_ADMISSION",
-            "message": "AUTO KEEP requires an N17 admission decision",
-        })
-    return automatic_decision
+        resolved = str(decision)
+    else:
+        if decision is not None or override not in {
+            "KEEP", "OVERRIDE_TO_ADMIT", "OVERRIDE_TO_NOT_ADMIT",
+        }:
+            raise HTTPException(422, detail={
+                "code": "INVALID_ADMISSION",
+                "message": "AUTO admission requires override and forbids decision",
+            })
+        if override == "OVERRIDE_TO_ADMIT":
+            resolved = "ADMIT"
+        elif override == "OVERRIDE_TO_NOT_ADMIT":
+            resolved = "NOT_ADMIT"
+        else:
+            automatic_decision = _automatic_admission_decision(context)
+            if automatic_decision is None:
+                raise HTTPException(422, detail={
+                    "code": "INVALID_ADMISSION",
+                    "message": "AUTO KEEP requires an N17 admission decision",
+                })
+            resolved = automatic_decision
+    if resolved == "ADMIT":
+        safety = _n16_safety_status(context)
+        if safety != "PASS":
+            raise HTTPException(422, detail={
+                "code": "CONTENT_SAFETY_NOT_PASS",
+                "message": f"内容安全结果为{safety}，仅PASS允许入库",
+            })
+    return resolved
 
 
 def _evaluation_record(row: Any) -> dict[str, Any]:

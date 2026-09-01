@@ -508,9 +508,16 @@ async def test_admitted_run_archives_exact_original_template_final_and_sources(t
         assert meme.original_meme_text.startswith("你说的对，但是《原神》")
         assert meme.canonical_template_text == "你说的对，但是《{主题}》是由{研发方}自主研发的一款{后续描述}。"
         assert meme.final_agu_text.endswith("他正在凿agu。")
+        meme_id = meme.id
         sources = (await session.execute(select(MemeSource).where(
             MemeSource.meme_id == meme.id
         ).order_by(MemeSource.sort_order))).scalars().all()
         assert [(source.source_role, source.source_id) for source in sources] == [
             ("ORIGINAL", "O001"), ("VARIANT", "V001"),
         ]
+
+    summary = await repo.get_formal_meme_summary(meme_id)
+    assert summary is not None
+    assert summary["final_agu_text"].endswith("他正在凿agu。")
+    assert summary["source_run_id"] == ctx.run_id
+    await repo.engine.dispose()
