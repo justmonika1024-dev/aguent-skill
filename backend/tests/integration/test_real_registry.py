@@ -1699,31 +1699,81 @@ async def test_n13_receives_restraint_weighted_evaluation_priorities():
 
 
 @pytest.mark.asyncio
-async def test_n13_awkward_candidate_cannot_pass_fluency_threshold():
+async def test_n13_injects_and_audits_evaluation_strategy_directives():
     llm = FakeLLMProvider(responses=[{
         "scores": [{
             "candidate_id": "C1",
-            "fluency": 10,
-            "recognition": 10,
-            "agu_fit": 10,
-            "humor": 10,
-            "rhythm": 10,
-            "adaptation_restraint": 10,
-            "minimal_replacement_effect": 10,
+            "fluency": 6,
+            "recognition": 8,
+            "agu_fit": 9,
             "qualified": True,
-            "reason": "模型认为表达自然",
         }],
         "qualified_candidate_ids": ["C1"],
     }])
     registry = build_real_registry(llm=llm, search=FakeSearchProvider())
 
     result = await registry.get("N13").execute({
+        "N05": {"original_text": "原始梗"},
+        "N10": {"canonical_template_text": "模板"},
+        "N12": {"candidates": [{
+            "candidate_id": "C1", "text": "他正在凿agu",
+        }]},
+    }, {
+        "strategy_snapshot": {"evaluation": {
+            "directives": ["优先检查指示结构", "优先检查指示结构", "核对动作受事"],
+            "minimum_fluency": 7,
+            "minimum_recognition": 8,
+            "minimum_agu_fit": 9,
+        }},
+    })
+
+    priorities = llm.requests[0].user_payload["evaluation_priorities"]
+    assert priorities["directives"] == ["优先检查指示结构", "核对动作受事"]
+    assert priorities["minimum_thresholds"] == {
+        "fluency": 7, "recognition": 8, "agu_fit": 9,
+    }
+    assert result["artifact"]["applied_evaluation_directives"] == [
+        "优先检查指示结构", "核对动作受事",
+    ]
+    assert result["outcome"] == "ALL_UNQUALIFIED"
+
+
+@pytest.mark.asyncio
+async def test_n13_awkward_candidate_cannot_pass_fluency_threshold():
+    candidate_texts = {
+        "C1": "我猜中了开头，却猜不中这凿agu",
+        "C2": "我猜中了开头，却猜不中那凿agu",
+        "C3": "我猜中了开头，却猜不中此凿agu",
+        "C4": "我猜中了开头，却猜不中这凿agu的结果",
+        "C5": "他先凿了小王，又凿agu",
+    }
+    high_score = {
+        "fluency": 10,
+        "recognition": 10,
+        "agu_fit": 10,
+        "humor": 10,
+        "rhythm": 10,
+        "adaptation_restraint": 10,
+        "minimal_replacement_effect": 10,
+        "qualified": True,
+        "reason": "模型认为表达自然",
+    }
+    llm = FakeLLMProvider(responses=[{
+        "scores": [
+            {**high_score, "candidate_id": candidate_id}
+            for candidate_id in candidate_texts
+        ],
+        "qualified_candidate_ids": list(candidate_texts),
+    }])
+    registry = build_real_registry(llm=llm, search=FakeSearchProvider())
+
+    result = await registry.get("N13").execute({
         "N05": {"original_text": "我猜中了开头，却猜不中这结局"},
         "N10": {"canonical_template_text": "我猜中了{开头内容}，却猜不中这{结局内容}"},
-        "N12": {"candidates": [{
-            "candidate_id": "C1",
-            "text": "我猜中了开头，却猜不中这凿agu",
-        }]},
+        "N12": {"candidates": [
+            {"candidate_id": candidate_id, "text": text}
+            for candidate_id, text in candidate_texts.items()
+        ]},
     }, {
         "strategy_snapshot": {
             "generation": {"reject_awkward_demonstrative_phrase": True},
@@ -1736,12 +1786,44 @@ async def test_n13_awkward_candidate_cannot_pass_fluency_threshold():
     })
 
     payload = result["artifact"]["llm"]
-    score = payload["scores"][0]
+    scores = {score["candidate_id"]: score for score in payload["scores"]}
+    assert result["outcome"] == "HAS_QUALIFIED"
+    assert payload["qualified_candidate_ids"] == ["C4"]
+    for candidate_id in ("C1", "C2", "C3"):
+        assert scores[candidate_id]["fluency"] < 6
+        assert scores[candidate_id]["qualified"] is False
+        assert "指示结构不通顺" in "".join(scores[candidate_id]["problems"])
+    assert scores["C4"]["fluency"] == 10
+    assert scores["C4"]["qualified"] is True
+    assert not scores["C4"]["problems"]
+    assert scores["C5"]["agu_fit"] < 6
+    assert scores["C5"]["qualified"] is False
+    assert "动作受事" in "".join(scores["C5"]["problems"])
+
+
+@pytest.mark.asyncio
+async def test_n13_default_thresholds_route_all_unqualified_back_to_n12():
+    llm = FakeLLMProvider(responses=[{
+        "scores": [{
+            "candidate_id": "C1",
+            "fluency": 5,
+            "recognition": 10,
+            "agu_fit": 10,
+            "qualified": True,
+        }],
+        "qualified_candidate_ids": ["C1"],
+    }])
+    registry = build_real_registry(llm=llm, search=FakeSearchProvider())
+
+    result = await registry.get("N13").execute({
+        "N12": {"candidates": [{
+            "candidate_id": "C1", "text": "他正在凿agu",
+        }]},
+    }, None)
+
     assert result["outcome"] == "ALL_UNQUALIFIED"
-    assert score["fluency"] < 6
-    assert score["qualified"] is False
-    assert payload["qualified_candidate_ids"] == []
-    assert "指示结构不通顺" in "".join(score.get("problems", [])) + score.get("reason", "")
+    assert result["artifact"]["llm"]["qualified_candidate_ids"] == []
+    assert TransitionTable().next("N13", "ALL_UNQUALIFIED", has_budget=True) == "N12"
 
 
 @pytest.mark.asyncio
@@ -1775,7 +1857,19 @@ async def test_n11_revalidates_template_coverage_without_llm_json_failure():
             {"variant_text": "大胆程序员，我一眼就看出你不是产品经理"},
             {"variant_text": "大胆机器人，我一眼就看出你不是人类"},
         ]},
-        "N10": {"canonical_template_text": template},
+        "N10": {
+            "canonical_template_text": template,
+            "fixed_segments": ["大胆", "，我一眼就看出你不是"],
+            "slots": [
+                {"name": "被呵斥对象"},
+                {"name": "表面身份"},
+            ],
+            "evidence_variant_texts": [
+                "大胆猫猫，我一眼就看出你不是人",
+                "大胆程序员，我一眼就看出你不是产品经理",
+                "大胆机器人，我一眼就看出你不是人类",
+            ],
+        },
     }, None)
     payload = result["artifact"]["llm"]
     assert payload["decision"] == "PASS"
@@ -1802,6 +1896,11 @@ async def test_n11_coverage_threshold_rejects_five_of_twenty_variants():
         "N09": {"variants": matching + nonmatching},
         "N10": {
             "canonical_template_text": "我猜中了{开头内容}，却猜不中这结局",
+            "fixed_segments": ["我猜中了", "，却猜不中这结局"],
+            "slots": [{"name": "开头内容"}],
+            "evidence_variant_texts": [
+                variant["variant_text"] for variant in matching
+            ],
         },
     }, {
         "strategy_snapshot": {
@@ -1815,9 +1914,133 @@ async def test_n11_coverage_threshold_rejects_five_of_twenty_variants():
     assert payload["original_reconstructable"] is True
     assert payload["matched_variant_count"] == 5
     assert payload["total_variant_count"] == 20
-    assert payload["coverage"] == pytest.approx(6 / 21)
+    assert payload["coverage"] == pytest.approx(5 / 20)
     assert payload["accuracy"] < 5
     assert payload["problems"]
+
+
+@pytest.mark.asyncio
+async def test_n11_coverage_threshold_rejects_two_of_four_variants_at_half():
+    matching = [
+        {"variant_text": "我猜中了起点，却猜不中这结局"},
+        {"variant_text": "我猜中了过程，却猜不中这结局"},
+    ]
+    nonmatching = [
+        {"variant_text": "我猜中了起点，却猜不中这收尾"},
+        {"variant_text": "我猜中了过程，却猜不中这收尾"},
+    ]
+    registry = build_real_registry(
+        llm=FakeLLMProvider(), search=FakeSearchProvider(),
+    )
+
+    result = await registry.get("N11").execute({
+        "N05": {"original_text": "我猜中了开头，却猜不中这结局"},
+        "N09": {"variants": matching + nonmatching},
+        "N10": {
+            "canonical_template_text": "我猜中了{开头内容}，却猜不中这结局",
+            "fixed_segments": ["我猜中了", "，却猜不中这结局"],
+            "slots": [{"name": "开头内容"}],
+            "evidence_variant_texts": [
+                "我猜中了起点，却猜不中这结局",
+                "我猜中了过程，却猜不中这结局",
+            ],
+        },
+    }, None)
+
+    payload = result["artifact"]["llm"]
+    assert result["outcome"] == "MORE_EVIDENCE"
+    assert payload["matched_variant_count"] == 2
+    assert payload["total_variant_count"] == 4
+    assert payload["coverage"] == pytest.approx(0.5)
+
+
+@pytest.mark.asyncio
+async def test_n11_reextracts_when_one_declared_slot_has_no_replacement_evidence():
+    variants = [
+        {"variant_text": "大胆猫猫，我一眼就看出你不是人"},
+        {"variant_text": "大胆程序员，我一眼就看出你不是人"},
+        {"variant_text": "大胆机器人，我一眼就看出你不是人"},
+    ]
+    registry = build_real_registry(
+        llm=FakeLLMProvider(), search=FakeSearchProvider(),
+    )
+
+    result = await registry.get("N11").execute({
+        "N05": {"original_text": "大胆妖孽，我一眼就看出你不是人"},
+        "N09": {"variants": variants},
+        "N10": {
+            "canonical_template_text": "大胆{被呵斥对象}，我一眼就看出你不是{表面身份}",
+            "fixed_segments": ["大胆", "，我一眼就看出你不是"],
+            "slots": [{"name": "被呵斥对象"}, {"name": "表面身份"}],
+            "evidence_variant_texts": [
+                variant["variant_text"] for variant in variants
+            ],
+        },
+    }, None)
+
+    payload = result["artifact"]["llm"]
+    assert result["outcome"] == "REEXTRACT"
+    assert payload["decision"] == "REEXTRACT"
+    assert any("表面身份" in problem and "缺少替换证据" in problem
+               for problem in payload["problems"])
+
+
+@pytest.mark.asyncio
+async def test_n11_reextracts_template_with_only_four_fixed_chars_and_catch_all_slot():
+    variants = [
+        {"variant_text": "我猜中了天气预报"},
+        {"variant_text": "我猜中了产品需求"},
+        {"variant_text": "我猜中了考试答案"},
+    ]
+    registry = build_real_registry(
+        llm=FakeLLMProvider(), search=FakeSearchProvider(),
+    )
+
+    result = await registry.get("N11").execute({
+        "N05": {"original_text": "我猜中了开头，却猜不中这结局"},
+        "N09": {"variants": variants},
+        "N10": {
+            "canonical_template_text": "我猜中了{任意内容}",
+            "fixed_segments": ["我猜中了"],
+            "slots": [{"name": "任意内容"}],
+            "evidence_variant_texts": [
+                variant["variant_text"] for variant in variants
+            ],
+        },
+    }, None)
+
+    payload = result["artifact"]["llm"]
+    assert result["outcome"] == "REEXTRACT"
+    assert payload["decision"] == "REEXTRACT"
+    assert any("固定结构过宽" in problem for problem in payload["problems"])
+
+
+@pytest.mark.asyncio
+async def test_n11_reextracts_unsupported_fixed_and_fabricated_variant_evidence():
+    variants = [
+        {"variant_text": "我猜中了起点，却猜不中这结局"},
+        {"variant_text": "我猜中了过程，却猜不中这结局"},
+        {"variant_text": "我猜中了终点，却猜不中这结局"},
+    ]
+    registry = build_real_registry(
+        llm=FakeLLMProvider(), search=FakeSearchProvider(),
+    )
+
+    result = await registry.get("N11").execute({
+        "N05": {"original_text": "我猜中了开头，却猜不中这结局"},
+        "N09": {"variants": variants},
+        "N10": {
+            "canonical_template_text": "我猜中了{开头内容}，却猜不中这结局",
+            "fixed_segments": ["万能前缀"],
+            "slots": [{"name": "开头内容"}],
+            "evidence_variant_texts": ["我猜中了虚构证据，却猜不中这结局"],
+        },
+    }, None)
+
+    payload = result["artifact"]["llm"]
+    assert result["outcome"] == "REEXTRACT"
+    assert any("fixed_segments" in problem for problem in payload["problems"])
+    assert any("evidence_variant_texts" in problem for problem in payload["problems"])
 
 
 @pytest.mark.asyncio
@@ -2102,12 +2325,15 @@ async def test_n09_and_n11_share_two_variant_search_retries_per_original():
     invalid_template_input = {
         "N05": {"original_text": original},
         "N09": {"variants": [
-            {"variant_text": "我猜中了开头，却猜不中agu被谁凿了"},
+            {"variant_text": "我猜中了起点，却猜不中这结局"},
             {"variant_text": "我猜中了开头，却猜不中是谁先动的手"},
             {"variant_text": "我猜中了开头，却猜不中群友最后凿了谁"},
         ]},
         "N10": {
             "canonical_template_text": "我猜中了{前半句}，却猜不中这结局",
+            "fixed_segments": ["我猜中了", "，却猜不中这结局"],
+            "slots": [{"name": "前半句"}],
+            "evidence_variant_texts": ["我猜中了起点，却猜不中这结局"],
         },
     }
     second = await registry.get("N11").execute(invalid_template_input, services)

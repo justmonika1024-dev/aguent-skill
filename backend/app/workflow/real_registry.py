@@ -315,8 +315,8 @@ _ACTION_ON_AGU = re.compile(
     rf")"
 )
 _AWKWARD_DEMONSTRATIVE_ACTION = re.compile(
-    rf"这\s*凿(?:了|着|过)?(?:一下|一遍|几下)?{_AGU_OBJECT}"
-    rf"(?!\s*的(?:人|事|行为|动作|场面|一幕))"
+    rf"(?:这|那|此)\s*凿(?:了|着|过)?(?:一下|一遍|几下)?{_AGU_OBJECT}"
+    rf"(?!\s*的)"
 )
 _TOOL_PAGE = re.compile(
     r"(?:meme\s*generator|生成器|在线制作|表情包制作|AI.{0,8}文案工具)",
@@ -608,6 +608,25 @@ def _template_pattern(template: str) -> re.Pattern[str]:
     return re.compile(f"^{pattern}$")
 
 
+def _template_captures(template: str, text: str) -> dict[str, list[str]] | None:
+    parts = re.split(r"(\{[^{}]+\})", _normalize_meme_text(template))
+    slot_names: list[str] = []
+    pattern_parts: list[str] = []
+    for part in parts:
+        if part.startswith("{") and part.endswith("}"):
+            slot_names.append(part[1:-1])
+            pattern_parts.append("(.*?)" if "可选" in part else "(.+?)")
+        else:
+            pattern_parts.append(re.escape(part))
+    match = re.fullmatch("".join(pattern_parts), _normalize_meme_text(text))
+    if match is None:
+        return None
+    captures: dict[str, list[str]] = {}
+    for name, captured in zip(slot_names, match.groups(), strict=True):
+        captures.setdefault(name, []).append(_canonical_original_key(captured))
+    return captures
+
+
 def _validate_template(template: str, original: str, variants: list[dict[str, Any]]) -> None:
     slots = re.findall(r"\{[^{}]+\}", template)
     fixed = re.sub(r"\{[^{}]+\}", "", template)
@@ -896,6 +915,35 @@ def _invalid_agu_identity(text: str) -> bool:
     return bool(re.search(r"agu是.{0,12}(游戏|作品|计划|身份|设定)", without_action))
 
 
+def _has_action_on_other_object(text: str) -> bool:
+    remaining = _ACTION_ON_AGU.sub("", text)
+    active = re.compile(
+        r"(?:^|[，。！？,!?；;]|我|你|他|她|我们|你们|他们|她们|群友|大家|"
+        r"先|又|再|正在|已经|还在|开始|继续|直接|竟然|居然|偷偷|狠狠地?)"
+        r"\s*凿(?P<tail>[^，。！？,!?；;\s]{1,20})"
+    )
+    for match in active.finditer(remaining):
+        tail = match.group("tail")
+        changed = True
+        while tail and changed:
+            changed = False
+            for prefix in ("一下", "一遍", "几下", "了", "着", "过"):
+                if tail.startswith(prefix):
+                    tail = tail[len(prefix):]
+                    changed = True
+                    break
+        if tail:
+            return True
+    ba_action = re.compile(r"(?:把|将)(?P<object>[^，。！？,!?；;]{1,20}?)(?:给)?凿")
+    if any("agu" not in match.group("object") for match in ba_action.finditer(remaining)):
+        return True
+    passive = re.compile(
+        r"(?P<object>[^，。！？,!?；;]{1,20}?)(?:被|让|给)"
+        r"(?:我|你|他|她|我们|你们|他们|她们|群友|大家)?(?:给)?凿"
+    )
+    return any("agu" not in match.group("object") for match in passive.finditer(remaining))
+
+
 def _n12_problem(parsed: dict[str, Any], value: dict[str, Any] | None = None) -> str | None:
     candidates = parsed.get("candidates", [])
     texts = [c.get("text", "") for c in candidates if isinstance(c, dict)]
@@ -950,6 +998,8 @@ class RealWorkflowNode:
         run_id = services.get("run_id", "unknown") if isinstance(services, dict) else context_run_id(value)
         outcome = self.outcome
         parsed: dict[str, Any]
+        applied_evaluation_directives: list[str] = []
+        n13_thresholds = {"fluency": 6, "recognition": 6, "agu_fit": 6}
         if self.key in {"N04", "N08"}:
             if self.search is None:
                 raise RuntimeError("search provider is not configured")
@@ -1266,14 +1316,14 @@ class RealWorkflowNode:
             original = original_node.get("original_text", "") if isinstance(original_node, dict) else ""
             variants = variants_node.get("variants", []) if isinstance(variants_node, dict) else []
             template = template_node.get("canonical_template_text", "") if isinstance(template_node, dict) else ""
-            slots = re.findall(r"\{[^{}]+\}", template)
+            slots = [slot[1:-1] for slot in re.findall(r"\{[^{}]+\}", template)]
+            unique_slots = list(dict.fromkeys(slots))
             fixed = re.sub(r"\{[^{}]+\}", "", template)
-            fixed_chars = re.sub(r"[\s，。！？、；：,.!?;:\"'《》]", "", fixed)
+            fixed_key = _canonical_original_key(fixed)
+            original_key = _canonical_original_key(str(original))
             pattern = _template_pattern(template)
-            original_reconstructable = bool(
-                slots
-                and len(fixed_chars) >= 4
-                and pattern.fullmatch(_normalize_meme_text(str(original)))
+            original_reconstructable = (
+                pattern.fullmatch(_normalize_meme_text(str(original))) is not None
             )
             matched = sum(
                 pattern.fullmatch(_normalize_meme_text(
@@ -1282,10 +1332,47 @@ class RealWorkflowNode:
                 for variant in variants if isinstance(variant, dict)
             )
             total = sum(isinstance(variant, dict) for variant in variants)
-            coverage = (
-                matched + int(original_reconstructable)
-            ) / (total + 1)
-            slot_evidence = min(1.0, matched / max(1, len(slots)))
+            coverage = matched / total if total else 0.0
+            fixed_segments = template_node.get("fixed_segments", [])
+            fixed_segments = [
+                str(segment) for segment in fixed_segments
+                if isinstance(segment, str) and segment
+            ] if isinstance(fixed_segments, list) else []
+            declared_slots = template_node.get("slots", [])
+            declared_slot_names = [
+                str(slot.get("name")) for slot in declared_slots
+                if isinstance(slot, dict) and slot.get("name")
+            ] if isinstance(declared_slots, list) else []
+            evidence_variant_texts = template_node.get("evidence_variant_texts", [])
+            evidence_variant_texts = list(dict.fromkeys(
+                str(text) for text in evidence_variant_texts
+                if isinstance(text, str) and text
+            )) if isinstance(evidence_variant_texts, list) else []
+            variant_keys = {
+                _canonical_original_key(str(variant.get("variant_text", "")))
+                for variant in variants if isinstance(variant, dict)
+            }
+            verified_evidence = [
+                text for text in evidence_variant_texts
+                if _canonical_original_key(text) in variant_keys
+                and pattern.fullmatch(_normalize_meme_text(text))
+            ]
+            original_captures = _template_captures(template, str(original)) or {}
+            evidence_captures = [
+                captures for text in verified_evidence
+                if (captures := _template_captures(template, text)) is not None
+            ]
+            slots_with_replacement = {
+                slot for slot in unique_slots
+                if any(
+                    captures.get(slot) != original_captures.get(slot)
+                    for captures in evidence_captures
+                )
+            }
+            slot_evidence = (
+                len(slots_with_replacement) / len(unique_slots)
+                if unique_slots else 0.0
+            )
             accuracy = max(1, min(5, 1 + round(4 * (
                 0.5 * int(original_reconstructable)
                 + 0.35 * coverage
@@ -1305,10 +1392,44 @@ class RealWorkflowNode:
                     or not 0 <= minimum_coverage <= 1):
                 minimum_coverage = 0.6
             problems: list[str] = []
-            if not slots or len(fixed_chars) < 4:
+            if not unique_slots:
                 problems.append("模板缺少可复用槽位或有意义的固定结构")
+            fixed_ratio = len(fixed_key) / max(1, len(original_key))
+            if len(fixed_key) < 5 or fixed_ratio < 0.4:
+                problems.append("模板固定结构过宽，不能用少量固定字配合通配槽吞入任意文本")
+            declared_fixed_key = _canonical_original_key("".join(fixed_segments))
+            if not fixed_segments or declared_fixed_key != fixed_key:
+                problems.append("fixed_segments与模板中的固定结构不一致")
+            unsupported_fixed = [
+                segment for segment in fixed_segments
+                if (segment_key := _canonical_original_key(segment))
+                and (
+                    segment_key not in original_key
+                    or any(
+                        segment_key not in _canonical_original_key(text)
+                        for text in verified_evidence
+                    )
+                )
+            ]
+            if unsupported_fixed:
+                problems.append(
+                    "固定片段缺少原句或变式证据：" + "、".join(unsupported_fixed),
+                )
+            if set(declared_slot_names) != set(unique_slots):
+                problems.append("slots声明与模板槽位不一致")
+            unsupported_evidence = [
+                text for text in evidence_variant_texts
+                if text not in verified_evidence
+            ]
+            if not evidence_variant_texts or unsupported_evidence:
+                problems.append("evidence_variant_texts缺少N09真实匹配变式支持")
+            for slot in unique_slots:
+                if slot not in slots_with_replacement:
+                    problems.append(f"槽位{slot}缺少替换证据")
             if not original_reconstructable:
                 problems.append("模板无法重建原句")
+                decision = "REEXTRACT"
+            elif problems:
                 decision = "REEXTRACT"
             elif coverage < minimum_coverage:
                 problems.append(
@@ -1486,12 +1607,36 @@ class RealWorkflowNode:
                 "do_not_force_every_slot_to_explain_action": True,
             }
         elif self.key == "N13":
+            strategy = (
+                services.get("strategy_snapshot", {})
+                if isinstance(services, dict) else {}
+            )
+            evaluation = strategy.get("evaluation", {}) if isinstance(strategy, dict) else {}
+            applied_evaluation_directives = list(dict.fromkeys(
+                directive for item in (
+                    evaluation.get("directives", [])
+                    if isinstance(evaluation, dict) else []
+                )
+                if isinstance(item, str)
+                and (directive := _safe_feedback_text(item))
+            ))
+            if isinstance(evaluation, dict):
+                n13_thresholds = {
+                    "fluency": evaluation.get("minimum_fluency", 6),
+                    "recognition": evaluation.get("minimum_recognition", 6),
+                    "agu_fit": evaluation.get("minimum_agu_fit", 6),
+                }
+            for field, threshold in list(n13_thresholds.items()):
+                if type(threshold) is not int or not 0 <= threshold <= 10:
+                    n13_thresholds[field] = 6
             payload["evaluation_priorities"] = {
                 "recognition_weight": 2,
                 "adaptation_restraint_weight": 2,
                 "minimum_replacement_effect_weight": 1,
                 "all_slots_semantic_relation_weight": 0,
                 "do_not_reward_explaining_every_slot": True,
+                "directives": applied_evaluation_directives,
+                "minimum_thresholds": dict(n13_thresholds),
             }
         exhausted_originals = (
             _runtime_exhausted_originals(services) if self.key == "N02" else []
@@ -1919,21 +2064,11 @@ class RealWorkflowNode:
                     if isinstance(services, dict) else {}
                 )
                 generation = strategy.get("generation", {}) if isinstance(strategy, dict) else {}
-                evaluation = strategy.get("evaluation", {}) if isinstance(strategy, dict) else {}
                 reject_awkward = (
                     generation.get("reject_awkward_demonstrative_phrase", True)
                     if isinstance(generation, dict) else True
                 )
-                thresholds = {
-                    "fluency": evaluation.get("minimum_fluency", 6),
-                    "recognition": evaluation.get("minimum_recognition", 6),
-                    "agu_fit": evaluation.get("minimum_agu_fit", 6),
-                } if isinstance(evaluation, dict) else {
-                    "fluency": 6, "recognition": 6, "agu_fit": 6,
-                }
-                for field, threshold in list(thresholds.items()):
-                    if type(threshold) is not int or not 0 <= threshold <= 10:
-                        thresholds[field] = 6
+                thresholds = n13_thresholds
                 normalized_scores: list[dict[str, Any]] = []
                 qualified_ids: list[str] = []
                 for raw_score in parsed.get("scores", []):
@@ -1964,6 +2099,14 @@ class RealWorkflowNode:
                             agu_fit = agu_fit_cap
                         score["agu_fit"] = min(agu_fit, agu_fit_cap)
                         problems.append("动宾关系不成立：凿的动作受事必须是agu")
+                    elif _has_action_on_other_object(text):
+                        agu_fit_cap = max(0, thresholds["agu_fit"] - 1)
+                        agu_fit = score.get("agu_fit")
+                        if (not isinstance(agu_fit, (int, float))
+                                or isinstance(agu_fit, bool)):
+                            agu_fit = agu_fit_cap
+                        score["agu_fit"] = min(agu_fit, agu_fit_cap)
+                        problems.append("动宾关系不成立：候选中存在凿其他动作受事")
                     score["problems"] = list(dict.fromkeys(problems))
                     score["qualified"] = bool(score.get("qualified")) and all(
                         isinstance(score.get(field), (int, float))
@@ -2043,6 +2186,9 @@ class RealWorkflowNode:
             )
             if extraction_mode:
                 artifact["extraction_mode"] = extraction_mode
+            if self.key == "N13":
+                artifact["applied_evaluation_directives"] = applied_evaluation_directives
+                artifact["minimum_thresholds"] = dict(n13_thresholds)
         except Exception:  # noqa: TRY203 - preserve the original typed validation error
             # A node that did not produce its business artifact must never be
             # routed as success. The engine records the failure for inspection.
