@@ -3,6 +3,7 @@ import { useState } from 'react'
 
 export interface ArtifactNode {
   execution_id?: string
+  execution_order?: number
   id?: string
   branch_id?: string
   node_key: string
@@ -79,15 +80,29 @@ function executionTime(node: ArtifactNode): number | undefined {
   return Number.isNaN(parsed) ? undefined : parsed
 }
 
+function executionSortKey(node: ArtifactNode): readonly [number, number, number, string] {
+  const time = executionTime(node)
+  return [
+    node.execution_order ?? Number.MAX_SAFE_INTEGER,
+    time ?? Number.NEGATIVE_INFINITY,
+    time === undefined ? (node.attempt_no ?? 0) : 0,
+    executionId(node),
+  ]
+}
+
 function compareExecutions(left: ArtifactNode, right: ArtifactNode): number {
-  const leftTime = executionTime(left)
-  const rightTime = executionTime(right)
-  if (leftTime !== undefined && rightTime !== undefined && leftTime !== rightTime) return leftTime - rightTime
-  if (left.node_key === right.node_key) {
-    const attemptDifference = (left.attempt_no ?? 0) - (right.attempt_no ?? 0)
-    if (attemptDifference) return attemptDifference
+  const leftKey = executionSortKey(left)
+  const rightKey = executionSortKey(right)
+  for (let index = 0; index < leftKey.length - 1; index += 1) {
+    const difference = (leftKey[index] as number) - (rightKey[index] as number)
+    if (difference) return difference
   }
-  return executionId(left).localeCompare(executionId(right))
+  return leftKey[3].localeCompare(rightKey[3])
+}
+
+function hasCompleteOrdering(nodes: readonly ArtifactNode[]): boolean {
+  return nodes.every((node) => node.execution_order !== undefined)
+    || nodes.every((node) => executionTime(node) !== undefined)
 }
 
 function unwrapArtifact(node: ArtifactNode | undefined): ArtifactRecord | undefined {
@@ -97,18 +112,18 @@ function unwrapArtifact(node: ArtifactNode | undefined): ArtifactRecord | undefi
 
 function currentRoundExecution(nodes: readonly ArtifactNode[], nodeKey: string): ArtifactNode | undefined {
   const ordered = [...nodes].sort(compareExecutions)
-  const hasCompleteOrdering = ordered.every((node) => executionTime(node) !== undefined)
+  const canCompareRoundBoundaries = hasCompleteOrdering(ordered)
   const roundEnds = ordered.filter((node) => node.node_key === 'N17')
   let candidates = ordered.filter((node) => node.node_key === nodeKey)
 
-  if (hasCompleteOrdering && roundEnds.length) {
+  if (canCompareRoundBoundaries && roundEnds.length) {
     const end = roundEnds.at(-1)!
     const start = roundEnds.at(-2)
     candidates = candidates.filter((node) => (
       (!start || compareExecutions(node, start) > 0)
       && compareExecutions(node, end) <= 0
     ))
-  } else if (!hasCompleteOrdering && roundEnds.length) {
+  } else if (!canCompareRoundBoundaries && roundEnds.length) {
     const roundAttempt = Math.max(...roundEnds.map((node) => node.attempt_no ?? 0))
     candidates = candidates.filter((node) => (node.attempt_no ?? 0) >= roundAttempt)
   }
@@ -124,7 +139,7 @@ function ancestorExecutionBeforeFork(
 ): ArtifactNode | undefined {
   const branchNodes = nodes.filter((node) => node.branch_id === branchId)
   const cutoff = branchNodes.find((node) => executionId(node) === forkedFromExecutionId)
-  if (!cutoff || executionTime(cutoff) === undefined || branchNodes.some((node) => executionTime(node) === undefined)) return undefined
+  if (!cutoff || !hasCompleteOrdering(branchNodes)) return undefined
 
   const ordered = [...branchNodes].sort(compareExecutions)
   const previousRoundEnd = ordered

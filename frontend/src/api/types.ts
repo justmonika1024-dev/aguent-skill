@@ -35,6 +35,7 @@ export interface CurrentRunResponse {
 
 export interface RunNode {
   execution_id?: string
+  execution_order?: number
   branch_id?: string
   node_key: string
   attempt_no?: number
@@ -43,6 +44,16 @@ export interface RunNode {
   output?: JsonValue
   error_code?: string | null
   error_message?: string | null
+  started_at?: string
+  ended_at?: string | null
+}
+
+export interface RunBranch {
+  branch_id: string
+  parent_branch_id?: string | null
+  forked_from_execution_id?: string | null
+  fork_reason?: string
+  is_final_active?: boolean
 }
 
 export interface SourceEvidence {
@@ -83,7 +94,7 @@ export interface ApiCallRecord {
 
 export interface RunRecord {
   run: RunSnapshot
-  branches: Array<Record<string, JsonValue>>
+  branches: RunBranch[]
   nodes: RunNode[]
   sources: SourceEvidence[]
   evaluations: Array<Record<string, JsonValue>>

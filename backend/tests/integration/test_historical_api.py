@@ -8,7 +8,13 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 
-from app.db.models import MemeRecord, RunHumanEvaluation, RunRecord, RunStrategyPatch
+from app.db.models import (
+    MemeRecord,
+    RunHumanEvaluation,
+    RunNodeExecution,
+    RunRecord,
+    RunStrategyPatch,
+)
 from app.db.persistence import SQLiteRepository
 from app.main import app
 from app.providers.fake import FakeLLMProvider, FakeSearchProvider
@@ -180,6 +186,71 @@ async def test_complete_historical_record_exposes_nodes_sources_evaluation_event
     assert record["evaluations"][0]["admission_decision"] == "REJECT"
     assert record["evaluations"][0]["processing_chain"] == {"score": 5}
     assert record["api_calls"][0]["provider"] == "exa"
+
+
+@pytest.mark.asyncio
+async def test_complete_record_exposes_stable_node_order_timestamps_and_branch_fork(
+    tmp_path, monkeypatch,
+):
+    repository = SQLiteRepository(f"sqlite+aiosqlite:///{tmp_path / 'record-order.db'}")
+    context = RunContext(mode=RunMode.AUTO_DISCOVERY, admission_mode=AdmissionMode.HUMAN)
+    await repository.create_run(context)
+    later = datetime(2026, 9, 1, 2, 0, 0, tzinfo=UTC)
+    earlier = datetime(2026, 9, 1, 1, 0, 0, tzinfo=UTC)
+    await repository.persist_node(
+        context,
+        "N09",
+        {"llm": {"variants": []}},
+        "INSUFFICIENT",
+        started_at=later,
+        ended_at=later,
+    )
+    await repository.persist_node(
+        context,
+        "N03",
+        {"llm": {"queries": []}},
+        "PLAN_READY",
+        started_at=earlier,
+        ended_at=earlier,
+    )
+    async with repository.session() as session:
+        fork_execution_id = await session.scalar(
+            select(RunNodeExecution.id).where(
+                RunNodeExecution.run_id == context.run_id,
+                RunNodeExecution.node_key == "N09",
+            ),
+        )
+    assert fork_execution_id is not None
+    child_branch_id = "corrected-branch"
+    await repository.persist_corrected_branch(
+        run_id=context.run_id,
+        branch_id=child_branch_id,
+        parent_branch_id=context.active_branch_id,
+        forked_from_execution_id=fork_execution_id,
+    )
+    api_router = importlib.import_module("app.api.router")
+    monkeypatch.setattr(api_router, "_engine", SimpleNamespace(repository=repository, contexts={}))
+
+    first_record = await api_router.complete_run_record(context.run_id)
+    second_record = await api_router.complete_run_record(context.run_id)
+
+    assert [node["node_key"] for node in first_record["nodes"]] == ["N03", "N09"]
+    assert [node["execution_order"] for node in first_record["nodes"]] == [0, 1]
+    assert [
+        (node["execution_id"], node["execution_order"])
+        for node in first_record["nodes"]
+    ] == [
+        (node["execution_id"], node["execution_order"])
+        for node in second_record["nodes"]
+    ]
+    assert datetime.fromisoformat(first_record["nodes"][0]["started_at"]) == earlier.replace(tzinfo=None)
+    assert datetime.fromisoformat(first_record["nodes"][0]["ended_at"]) == earlier.replace(tzinfo=None)
+    child_branch = next(
+        branch for branch in first_record["branches"]
+        if branch["branch_id"] == child_branch_id
+    )
+    assert child_branch["parent_branch_id"] == context.active_branch_id
+    assert child_branch["forked_from_execution_id"] == fork_execution_id
 
 
 @pytest.mark.asyncio
