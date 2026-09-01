@@ -1,8 +1,14 @@
+import json
+
 import pytest
 
 from app.providers.base import SearchBatch, SearchResult
 from app.providers.fake import FakeLLMProvider, FakeSearchProvider
-from app.workflow.real_registry import build_real_registry
+from app.workflow.real_registry import (
+    _compact_artifacts,
+    build_real_registry,
+    derive_required_patch_operations,
+)
 
 
 class FailingLLM:
@@ -40,6 +46,157 @@ class UsageRepositoryStub:
 
     async def record_api_call(self, *args, **kwargs):
         self.api_calls.append({"args": args, "kwargs": kwargs})
+
+
+def test_low_variant_scores_force_search_quality_patch():
+    evaluation = {
+        "variant_search_plan": {
+            "slot_replacement_targeting": 2,
+            "query_diversity": 3,
+            "ugc_orientation": 2,
+            "noise_avoidance": 2,
+            "comment": "结果基本都是原句转载",
+        },
+        "variant_search_results": {
+            "relevance": 3,
+            "real_variant_ratio": 1,
+            "independent_evidence_quality": 2,
+            "variant_diversity": 2,
+            "comment": "没有网友槽位改编",
+        },
+    }
+
+    operations = derive_required_patch_operations(evaluation, [])
+
+    assert {op["path"] for op in operations} >= {
+        "/search/prefer_ugc_sources",
+        "/search/exclude_exact_reprints",
+        "/search/require_slot_replacement",
+    }
+    assert any("原句转载" in str(op["value"]) for op in operations)
+
+
+def test_patch_operations_merge_llm_advice_with_whitelist_deduplication_and_text_limit():
+    long_advice = "优先网友槽位改编" * 100
+    evaluation = {
+        "variant_search_plan": {
+            "slot_replacement_targeting": 5,
+            "query_diversity": 5,
+            "ugc_orientation": 5,
+            "noise_avoidance": 5,
+            "comment": "",
+        },
+        "variant_search_results": {
+            "relevance": 5,
+            "real_variant_ratio": 5,
+            "independent_evidence_quality": 5,
+            "variant_diversity": 5,
+            "comment": "",
+        },
+        "template_extraction": {
+            "accuracy": 3,
+            "original_reconstruction": 5,
+            "variant_coverage": 5,
+            "slot_rationality": 5,
+            "comment": "模板覆盖不足",
+        },
+    }
+    llm_patch = [
+        {"op": "add", "path": "/search/variant_query_directives/-", "value": long_advice},
+        {"op": "add", "path": "/search/variant_query_directives/-", "value": long_advice},
+        {"op": "replace", "path": "/budgets/max_cost", "value": 999},
+        {"op": "remove", "path": "/search/prefer_ugc_sources"},
+    ]
+
+    operations = derive_required_patch_operations(evaluation, llm_patch)
+
+    assert all(op["path"] != "/budgets/max_cost" for op in operations)
+    assert all(op["op"] in {"add", "replace"} for op in operations)
+    llm_directives = [
+        op["value"] for op in operations
+        if op["path"] == "/search/variant_query_directives/-"
+        and str(op["value"]).startswith("优先网友槽位改编")
+    ]
+    assert len(llm_directives) == 1
+    assert len(llm_directives[0]) == 300
+    assert any(
+        op["path"] == "/search/variant_query_directives/-"
+        and "模板覆盖不足" in str(op["value"])
+        for op in operations
+    )
+
+
+@pytest.mark.asyncio
+async def test_n19_patch_artifact_contains_required_feedback_translation_fields():
+    evaluation = {
+        "variant_search_plan": {
+            "slot_replacement_targeting": 2,
+            "query_diversity": 3,
+            "ugc_orientation": 2,
+            "noise_avoidance": 2,
+            "comment": "结果基本都是原句转载",
+        },
+        "variant_search_results": {
+            "relevance": 3,
+            "real_variant_ratio": 1,
+            "independent_evidence_quality": 2,
+            "variant_diversity": 2,
+            "comment": "没有网友槽位改编",
+        },
+    }
+    registry = build_real_registry(
+        llm=FakeLLMProvider(responses=[{
+            "feedback_summary": "需要提高变式搜索质量",
+            "affected_nodes": ["N07", "N09", "NOT_A_NODE"],
+            "patch_operations": [{
+                "op": "add",
+                "path": "/search/variant_query_directives/-",
+                "value": "优先搜索独立网友改编",
+            }, {
+                "op": "replace",
+                "path": "/safety/allow_unsafe",
+                "value": True,
+            }],
+            "score_gaps": {"untrusted": 99},
+            "next_round_hypotheses": ["真实变式比例提升"],
+        }]),
+        search=FakeSearchProvider(),
+    )
+
+    result = await registry.get("N19").execute({"N18": evaluation}, None)
+    artifact = result["artifact"]
+
+    assert set(artifact) >= {
+        "feedback_summary", "affected_nodes", "patch_operations", "score_gaps",
+        "next_round_hypotheses", "before_strategy_version_id",
+        "after_strategy_version_id",
+    }
+    assert artifact["score_gaps"]["variant_search_results.real_variant_ratio"] == 3
+    assert "untrusted" not in artifact["score_gaps"]
+    assert "NOT_A_NODE" not in artifact["affected_nodes"]
+    assert all(op["path"] != "/safety/allow_unsafe" for op in artifact["patch_operations"])
+
+
+def test_n05_compacts_search_pages_without_dropping_seed_evidence():
+    seed = "你们干什么？我是来开会的！"
+    exact_evidence = "我是来开会的，你们要干什么？"
+    sources = [{
+        "source_id": f"O{index:03d}",
+        "url": f"https://example.com/{index}",
+        "title": f"搜索结果{index}",
+        "text": ("无关正文" * 700) + (exact_evidence if index == 12 else "无关结尾"),
+        "status": "VALID",
+        "evidence_type": "EXTRACTED_TEXT",
+    } for index in range(1, 13)]
+
+    compact = _compact_artifacts("N05", {
+        "START": {"mode": "MANUAL_SEED", "seed_text": seed},
+        "N04": {"sources": sources, "results": sources},
+    })
+
+    serialized = json.dumps(compact, ensure_ascii=False)
+    assert len(serialized) <= 12_000
+    assert any(exact_evidence in source["text"] for source in compact["N04"]["sources"])
 
 
 @pytest.mark.asyncio

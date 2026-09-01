@@ -54,8 +54,151 @@ _INSTRUCTIONS = {
     "N13": "对N12五条候选评分。输出scores数组，含candidate_id、fluency、recognition、agu_fit、humor、rhythm、adaptation_restraint、minimal_replacement_effect、qualified，并输出qualified_candidate_ids。优先奖励原梗辨识度、改编克制度和最小替换效果；不要因研发方、描述等所有槽位都强行解释凿而加分。",
     "N14": "只从N13合格候选中选出一条，不得改写。输出selected_candidate_id、ranked_candidate_ids、selection_reason。",
     "N15": "生成正式梗包装。final_agu_text必须逐字等于N14选中的N12候选；输出title(4到40字)、normalized_title、final_agu_text、original、template、source_url。",
-    "N19": "根据人工评价输出策略反馈摘要。输出feedback_summary、affected_nodes、next_round_hypotheses。",
+    "N19": (
+        "根据七模块人工评价输出下一轮策略反馈。必须输出feedback_summary、affected_nodes、"
+        "patch_operations、score_gaps、next_round_hypotheses。patch_operations只能建议add或replace，"
+        "不得修改预算、安全、候选数量或路由。"
+    ),
 }
+
+
+_MAX_FEEDBACK_TEXT_LENGTH = 300
+_ALLOWED_PATCH_PATHS = {
+    "/search/discovery_directives/-",
+    "/search/variant_query_directives/-",
+    "/search/prefer_ugc_sources",
+    "/search/exclude_exact_reprints",
+    "/search/require_slot_replacement",
+    "/search/max_variant_search_retries",
+    "/search/minimum_valid_variants",
+    "/search/minimum_independent_variant_sources",
+    "/search/minimum_template_coverage",
+    "/generation/directives/-",
+    "/generation/prefer_minimal_replacement",
+    "/generation/reject_awkward_demonstrative_phrase",
+    "/evaluation/directives/-",
+    "/evaluation/minimum_fluency",
+    "/evaluation/minimum_recognition",
+    "/evaluation/minimum_agu_fit",
+    "/admission/directives/-",
+}
+_EVALUATION_NODE_MAP = {
+    "original_search_plan": ["N03", "N04"],
+    "selected_original_meme": ["N05", "N06"],
+    "variant_search_plan": ["N07"],
+    "variant_search_results": ["N08", "N09"],
+    "template_extraction": ["N10", "N11"],
+    "candidate_generation": ["N12", "N13", "N14"],
+    "final_result": ["N15", "N17"],
+}
+_WORKFLOW_NODE_KEYS = {
+    "N01", "N02", "N03", "N04", "N05", "N06", "N07", "N08", "N09",
+    "N10", "N11", "N11.5", "N12", "N13", "N14", "N15", "N16", "N17",
+    "N18", "N19", "N20",
+}
+
+
+def _safe_feedback_text(value: Any) -> str:
+    return " ".join(str(value or "").split())[:_MAX_FEEDBACK_TEXT_LENGTH]
+
+
+def _score_gaps(evaluation: dict[str, Any]) -> dict[str, int]:
+    gaps: dict[str, int] = {}
+    for module, scores in evaluation.items():
+        if not isinstance(scores, dict):
+            continue
+        for field, score in scores.items():
+            if field != "comment" and type(score) is int and 1 <= score < 4:
+                gaps[f"{module}.{field}"] = 4 - score
+    return gaps
+
+
+def _affected_nodes(evaluation: dict[str, Any]) -> list[str]:
+    affected: list[str] = []
+    gaps = _score_gaps(evaluation)
+    for module, nodes in _EVALUATION_NODE_MAP.items():
+        if any(key.startswith(module + ".") for key in gaps):
+            affected.extend(nodes)
+    return list(dict.fromkeys(affected))
+
+
+def _safe_patch_operation(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    operation = raw.get("op")
+    path = str(raw.get("path", ""))
+    if operation not in {"add", "replace"} or path not in _ALLOWED_PATCH_PATHS:
+        return None
+    if "value" not in raw:
+        return None
+    value = raw["value"]
+    if isinstance(value, str):
+        value = _safe_feedback_text(value)
+        if not value:
+            return None
+    elif isinstance(value, list):
+        value = list(dict.fromkeys(
+            text for item in value if (text := _safe_feedback_text(item))
+        ))
+    if path.endswith("/-") and (operation != "add" or not isinstance(value, str)):
+        return None
+    return {"op": operation, "path": path, "value": value}
+
+
+def derive_required_patch_operations(
+    evaluation: dict[str, Any], llm_patch: Any,
+) -> list[dict[str, Any]]:
+    """Merge safe LLM advice with mandatory low-score search corrections."""
+    suggested = [
+        operation for raw in (llm_patch if isinstance(llm_patch, list) else [])
+        if (operation := _safe_patch_operation(raw)) is not None
+    ]
+    gaps = _score_gaps(evaluation)
+    search_modules = ("variant_search_plan", "variant_search_results", "template_extraction")
+    low_search_modules = [
+        module for module in search_modules
+        if any(key.startswith(module + ".") for key in gaps)
+    ]
+    required: list[dict[str, Any]] = []
+    if low_search_modules:
+        required.extend([
+            {"op": "replace", "path": "/search/prefer_ugc_sources", "value": True},
+            {"op": "replace", "path": "/search/exclude_exact_reprints", "value": True},
+            {"op": "replace", "path": "/search/require_slot_replacement", "value": True},
+        ])
+        comments = [
+            _safe_feedback_text(evaluation.get(module, {}).get("comment", ""))
+            for module in low_search_modules
+            if isinstance(evaluation.get(module), dict)
+        ]
+        comments = [comment for comment in comments if comment]
+        gap_names = [key for key in gaps if key.split(".", 1)[0] in low_search_modules]
+        feedback = "；".join(comments) or "、".join(gap_names)
+        required.append({
+            "op": "add",
+            "path": "/search/variant_query_directives/-",
+            "value": _safe_feedback_text(
+                f"人工评价低于4分：{feedback}；下一轮优先UGC来源，排除原句转载，并要求网友槽位替换。"
+            ),
+        })
+
+    operations: list[dict[str, Any]] = []
+    scalar_indexes: dict[str, int] = {}
+    directive_keys: set[tuple[str, str]] = set()
+    for operation in [*suggested, *required]:
+        path = operation["path"]
+        if path.endswith("/-"):
+            key = (path, operation["value"].casefold())
+            if key not in directive_keys:
+                directive_keys.add(key)
+                operations.append(operation)
+            continue
+        if path in scalar_indexes:
+            operations[scalar_indexes[path]] = operation
+        else:
+            scalar_indexes[path] = len(operations)
+            operations.append(operation)
+    return operations
 
 
 def _compact_artifacts(node_key: str, value: dict[str, Any]) -> dict[str, Any]:
@@ -68,6 +211,31 @@ def _compact_artifacts(node_key: str, value: dict[str, Any]) -> dict[str, Any]:
         "N15": ["N05", "N10", "N12", "N14"], "N19": ["N13", "N14", "N15", "N18"],
     }.get(node_key, list(value))
     result = {key: value[key] for key in keep if key in value}
+    if node_key == "N05" and isinstance(result.get("N04"), dict):
+        seed = str(result.get("START", {}).get("seed_text", ""))
+        anchors = [part.strip() for part in re.split(r"[，。！？?!]", seed)
+                   if len(part.strip()) >= 4]
+        compact_search = dict(result["N04"])
+        ranked_sources = sorted(
+            enumerate(compact_search.get("sources", [])),
+            key=lambda pair: (
+                -sum(anchor in (str(pair[1].get("title", ""))
+                                + str(pair[1].get("text", "")))
+                     for anchor in anchors),
+                pair[0],
+            ),
+        )
+        compact_sources = []
+        for _, source in ranked_sources[:10]:
+            item = dict(source)
+            text = str(item.get("text", ""))
+            match = next((text.find(anchor) for anchor in anchors if anchor in text), -1)
+            start = max(0, match - 200) if match >= 0 else 0
+            item["text"] = text[start:start + 700]
+            compact_sources.append(item)
+        compact_search["sources"] = compact_sources
+        compact_search.pop("results", None)
+        result["N04"] = compact_search
     if node_key == "N09" and isinstance(result.get("N08"), dict):
         selected = result.get("N05", {})
         selected = selected.get("llm", selected) if isinstance(selected, dict) else {}
@@ -632,8 +800,21 @@ class RealWorkflowNode:
             anchors = selected.get("fixed_anchors", []) if isinstance(selected, dict) else []
             if not original:
                 raise ValueError("N07 requires the one original meme selected by N05")
+            strategy = services.get("strategy_snapshot", {}) if isinstance(services, dict) else {}
+            search_strategy = strategy.get("search", {}) if isinstance(strategy, dict) else {}
+            directives = [
+                _safe_feedback_text(item)
+                for item in search_strategy.get("variant_query_directives", [])
+                if isinstance(item, str) and _safe_feedback_text(item)
+            ] if isinstance(search_strategy, dict) else []
             parsed = {"queries": _variant_search_plan(original, anchors)}
-            return {"outcome": self.outcome, "artifact": {"llm": parsed, "planning_mode": "DETERMINISTIC_FROM_N05"}}
+            return {"outcome": self.outcome, "artifact": {
+                "llm": parsed,
+                "planning_mode": "DETERMINISTIC_FROM_N05",
+                "applied_directives": list(dict.fromkeys(directives)),
+                "strategy_version_id": services.get("strategy_version_id")
+                if isinstance(services, dict) else None,
+            }}
         if self.key == "N10" and isinstance(value, dict):
             original_node = value.get("N05", {})
             original_node = original_node.get("llm", original_node) if isinstance(original_node, dict) else {}
@@ -943,11 +1124,28 @@ class RealWorkflowNode:
             self.repository, "list_formal_meme_titles"
         ):
             payload["formal_meme_titles"] = await self.repository.list_formal_meme_titles()
+        output_schema: dict[str, Any] = {"type": "object", "additionalProperties": True}
+        if self.key == "N19":
+            output_schema = {
+                "type": "object",
+                "properties": {
+                    "feedback_summary": {"type": "string"},
+                    "affected_nodes": {"type": "array", "items": {"type": "string"}},
+                    "patch_operations": {"type": "array", "items": {"type": "object"}},
+                    "score_gaps": {"type": "object"},
+                    "next_round_hypotheses": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": [
+                    "feedback_summary", "affected_nodes", "patch_operations", "score_gaps",
+                    "next_round_hypotheses",
+                ],
+                "additionalProperties": True,
+            }
         request = NodeLLMRequest(
             node_key=self.key,
             system_prompt="你是凿agugent工作流节点。只返回JSON对象。" + _INSTRUCTIONS.get(self.key, ""),
             user_payload=payload,
-            output_schema={"type": "object", "additionalProperties": True},
+            output_schema=output_schema,
             schema_name=self.key.replace(".", "_"),
             parameter_profile=ParameterProfile(max_output_tokens=_MAX_OUTPUT_TOKENS.get(self.key, 2000), temperature=0.2),
         )
@@ -1276,7 +1474,33 @@ class RealWorkflowNode:
                 parsed.setdefault("title", parsed.get("formal_title", "正式梗"))
                 parsed.setdefault("original", parsed.get("original_text", ""))
                 parsed.setdefault("template", parsed.get("template_text", ""))
-            artifact = {"llm": parsed, "provider_request_id": result.provider_request_id if result else None}
+            elif self.key == "N19":
+                evaluation = value.get("N18", {}) if isinstance(value, dict) else {}
+                evaluation = evaluation if isinstance(evaluation, dict) else {}
+                llm_affected = parsed.get("affected_nodes", [])
+                parsed["feedback_summary"] = _safe_feedback_text(
+                    parsed.get("feedback_summary") or evaluation.get("overall_comment", "")
+                )
+                parsed["affected_nodes"] = list(dict.fromkeys([
+                    *[node for node in llm_affected if node in _WORKFLOW_NODE_KEYS],
+                    *_affected_nodes(evaluation),
+                ]))
+                parsed["patch_operations"] = derive_required_patch_operations(
+                    evaluation, parsed.get("patch_operations", []),
+                )
+                parsed["score_gaps"] = _score_gaps(evaluation)
+                hypotheses = parsed.get("next_round_hypotheses", [])
+                parsed["next_round_hypotheses"] = list(dict.fromkeys(
+                    text for item in (hypotheses if isinstance(hypotheses, list) else [])[:10]
+                    if (text := _safe_feedback_text(item))
+                ))
+                parsed["before_strategy_version_id"] = None
+                parsed["after_strategy_version_id"] = None
+            artifact = (
+                {**parsed, "provider_request_id": result.provider_request_id if result else None}
+                if self.key == "N19"
+                else {"llm": parsed, "provider_request_id": result.provider_request_id if result else None}
+            )
             if extraction_mode:
                 artifact["extraction_mode"] = extraction_mode
         except Exception:  # noqa: TRY203 - preserve the original typed validation error

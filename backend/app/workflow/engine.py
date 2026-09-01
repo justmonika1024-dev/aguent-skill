@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from typing import Any
+from uuid import uuid4
 
 from .context import AdmissionMode, RunContext, RunMode, RunState, utcnow
 from .events import Command, Event, EventBus
@@ -204,7 +205,13 @@ class WorkflowEngine:
                         # Existing node implementations may use the compact one-argument
                         # contract; provider-backed nodes accept ``services`` as well.
                         params = inspect.signature(n.execute).parameters
-                        services = {"run_id": context.run_id, "repository": self.repository, "services": self.services}
+                        services = {
+                            "run_id": context.run_id,
+                            "repository": self.repository,
+                            "services": self.services,
+                            "strategy_version_id": context.strategy_version_id,
+                            "strategy_snapshot": context.strategy_snapshot,
+                        }
                         result = await (n.execute(context.active_artifacts, services)
                                         if len(params) >= 2 else n.execute(context.active_artifacts))  # type: ignore[call-arg]
                         self.validator.validate(result)
@@ -247,6 +254,36 @@ class WorkflowEngine:
                         if self.repository:
                             await self.repository.archive_run(context)
                         break
+                if node == "N18" and isinstance(output, dict):
+                    output = dict(output)
+                    output.setdefault("evaluation_id", uuid4().hex)
+                if node == "N19" and outcome == "PATCH_VALID" and isinstance(output, dict):
+                    output = dict(output)
+                    before_version_id = context.strategy_version_id
+                    output["before_strategy_version_id"] = before_version_id
+                    output["after_strategy_version_id"] = before_version_id
+                    if self.repository and before_version_id:
+                        evaluation = context.active_artifacts.get("N18", {})
+                        evaluation_id = (
+                            evaluation.get("evaluation_id")
+                            if isinstance(evaluation, dict) else None
+                        ) or uuid4().hex
+                        try:
+                            after_version_id, strategy_snapshot = (
+                                await self.repository.apply_strategy_patch(
+                                    source_run_id=context.run_id,
+                                    evaluation_id=evaluation_id,
+                                    before_version_id=before_version_id,
+                                    patch=output,
+                                )
+                            )
+                        except Exception as exc:
+                            outcome = "PATCH_INVALID"
+                            output["patch_error"] = str(exc)
+                        else:
+                            context.strategy_version_id = after_version_id
+                            context.strategy_snapshot = strategy_snapshot
+                            output["after_strategy_version_id"] = after_version_id
                 context.node_outputs[node] = output
                 context.active_artifacts[node] = output
                 if self.repository and node != "START":

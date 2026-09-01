@@ -2,7 +2,10 @@ import asyncio
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import select
 
+from app.db.models import RunNodeExecution
+from app.db.persistence import SQLiteRepository
 from app.main import app
 from app.workflow.context import AdmissionMode, RunMode, RunState
 from app.workflow.engine import WorkflowConflict, WorkflowEngine
@@ -16,6 +19,56 @@ class FakeNode:
 
     async def execute(self, node_input, services):
         return {"outcome": self.outcome, "artifact": {"ok": self.key}}
+
+
+class StrategyAwareN07(FakeNode):
+    async def execute(self, node_input, services):
+        strategy = services.get("strategy_snapshot", {
+            "search": {"variant_query_directives": []},
+        })
+        return {
+            "outcome": self.outcome,
+            "artifact": {
+                "ok": self.key,
+                "applied_directives": strategy["search"]["variant_query_directives"],
+            },
+        }
+
+
+class FeedbackN19(FakeNode):
+    async def execute(self, node_input, services):
+        return {
+            "outcome": self.outcome,
+            "artifact": {
+                "feedback_summary": "第一轮变式搜索结果基本都是原句转载",
+                "affected_nodes": ["N07", "N09"],
+                "patch_operations": [{
+                    "op": "add",
+                    "path": "/search/variant_query_directives/-",
+                    "value": "排除原句转载，优先搜索网友槽位改编",
+                }],
+                "score_gaps": {"variant_search_results.real_variant_ratio": 3},
+                "next_round_hypotheses": ["真实变式比例提升"],
+            },
+        }
+
+
+class InvalidFeedbackN19(FakeNode):
+    async def execute(self, node_input, services):
+        return {
+            "outcome": self.outcome,
+            "artifact": {
+                "feedback_summary": "尝试修改不可变预算",
+                "affected_nodes": ["N07"],
+                "patch_operations": [{
+                    "op": "replace",
+                    "path": "/budgets/max_cost",
+                    "value": 999,
+                }],
+                "score_gaps": {},
+                "next_round_hypotheses": [],
+            },
+        }
 
 
 @pytest.mark.asyncio
@@ -38,6 +91,124 @@ async def test_manual_run_waits_for_evaluation_and_accepts_idempotent_command():
     result = await engine.command(ctx.run_id, command)
     assert result["accepted"]
     assert await engine.command(ctx.run_id, command) == result
+
+
+@pytest.mark.asyncio
+async def test_next_round_strategy_is_applied_before_second_n07(tmp_path):
+    outcomes = {
+        "N01": "ACCEPTED", "N02": "PLANNED", "N03": "PLAN_READY",
+        "N04": "RESULTS_FOUND", "N05": "SELECTED", "N06": "NOT_DUPLICATE",
+        "N07": "PLAN_READY", "N08": "RESULTS_FOUND", "N09": "SUFFICIENT",
+        "N10": "TEMPLATE_READY", "N11": "PASS",
+        "N11.5": "DIRECT_SLOT_FILL", "N12": "VALID_BATCH",
+        "N13": "HAS_QUALIFIED", "N14": "SELECTED", "N15": "DRAFT_READY",
+        "N16": "NOT_DUPLICATE", "N17": "WAIT_HUMAN_DECISION",
+        "N19": "PATCH_VALID", "N20": "COMPLETED",
+    }
+    nodes = {key: FakeNode(key, outcome) for key, outcome in outcomes.items()}
+    nodes["N07"] = StrategyAwareN07("N07", "PLAN_READY")
+    nodes["N19"] = FeedbackN19("N19", "PATCH_VALID")
+    repository = SQLiteRepository(f"sqlite+aiosqlite:///{tmp_path / 'next-round.db'}")
+    engine = WorkflowEngine(NodeRegistry(nodes), repository=repository)
+    context = await engine.start_run(
+        mode=RunMode.AUTO_DISCOVERY,
+        admission_mode=AdmissionMode.AUTO,
+        continuous_enabled=True,
+    )
+    before_version_id = context.strategy_version_id
+
+    for _ in range(500):
+        if context.current_state is RunState.WAITING_HUMAN_EVALUATION:
+            break
+        await asyncio.sleep(0.002)
+    assert context.current_state is RunState.WAITING_HUMAN_EVALUATION
+
+    await engine.submit_evaluation(
+        context.run_id,
+        {"overall_comment": "第一轮变式搜索结果基本都是原句转载"},
+        expected_run_version=context.run_version,
+        branch_id=context.active_branch_id,
+    )
+    for _ in range(500):
+        if (context.current_state is RunState.WAITING_HUMAN_EVALUATION
+                and context.strategy_version_id != before_version_id):
+            break
+        await asyncio.sleep(0.002)
+
+    assert context.current_state is RunState.WAITING_HUMAN_EVALUATION
+    assert context.strategy_version_id != before_version_id
+    assert context.node_outputs["N07"]["applied_directives"] == [
+        "排除原句转载，优先搜索网友槽位改编",
+    ]
+    n19 = context.node_outputs["N19"]
+    assert n19["before_strategy_version_id"] == before_version_id
+    assert n19["after_strategy_version_id"] == context.strategy_version_id
+    async with repository.session() as session:
+        n07_executions = (await session.execute(
+            select(RunNodeExecution)
+            .where(RunNodeExecution.run_id == context.run_id)
+            .where(RunNodeExecution.node_key == "N07")
+            .order_by(RunNodeExecution.attempt_no)
+        )).scalars().all()
+    assert len(n07_executions) == 2
+    assert n07_executions[-1].strategy_version_id == context.strategy_version_id
+    assert n07_executions[-1].output_json["applied_directives"] == [
+        "排除原句转载，优先搜索网友槽位改编",
+    ]
+
+    await engine.command(context.run_id, Command(
+        "TERMINATE", expected_run_version=context.run_version,
+    ))
+
+
+@pytest.mark.asyncio
+async def test_invalid_n19_patch_routes_to_intervention_with_specific_error(tmp_path):
+    outcomes = {
+        "N01": "ACCEPTED", "N02": "PLANNED", "N03": "PLAN_READY",
+        "N04": "RESULTS_FOUND", "N05": "SELECTED", "N06": "NOT_DUPLICATE",
+        "N07": "PLAN_READY", "N08": "RESULTS_FOUND", "N09": "SUFFICIENT",
+        "N10": "TEMPLATE_READY", "N11": "PASS",
+        "N11.5": "DIRECT_SLOT_FILL", "N12": "VALID_BATCH",
+        "N13": "HAS_QUALIFIED", "N14": "SELECTED", "N15": "DRAFT_READY",
+        "N16": "NOT_DUPLICATE", "N17": "WAIT_HUMAN_DECISION",
+        "N19": "PATCH_VALID", "N20": "COMPLETED",
+    }
+    nodes = {key: FakeNode(key, outcome) for key, outcome in outcomes.items()}
+    nodes["N19"] = InvalidFeedbackN19("N19", "PATCH_VALID")
+    repository = SQLiteRepository(f"sqlite+aiosqlite:///{tmp_path / 'invalid-patch.db'}")
+    engine = WorkflowEngine(NodeRegistry(nodes), repository=repository)
+    context = await engine.start_run(
+        mode=RunMode.AUTO_DISCOVERY,
+        admission_mode=AdmissionMode.AUTO,
+        continuous_enabled=True,
+    )
+    before_version_id = context.strategy_version_id
+    for _ in range(500):
+        if context.current_state is RunState.WAITING_HUMAN_EVALUATION:
+            break
+        await asyncio.sleep(0.002)
+
+    await engine.submit_evaluation(
+        context.run_id,
+        {"overall_comment": "不要修改预算"},
+        expected_run_version=context.run_version,
+        branch_id=context.active_branch_id,
+    )
+    for _ in range(500):
+        if context.current_state is RunState.WAITING_HUMAN_INTERVENTION:
+            break
+        await asyncio.sleep(0.002)
+
+    assert context.current_state is RunState.WAITING_HUMAN_INTERVENTION
+    assert context.strategy_version_id == before_version_id
+    artifact = context.node_outputs["N19"]
+    assert artifact["before_strategy_version_id"] == before_version_id
+    assert artifact["after_strategy_version_id"] == before_version_id
+    assert "path not allowed: budgets" in artifact["patch_error"]
+
+    await engine.command(context.run_id, Command(
+        "TERMINATE", expected_run_version=context.run_version,
+    ))
 
 
 @pytest.mark.asyncio
