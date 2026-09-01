@@ -1699,6 +1699,52 @@ async def test_n13_receives_restraint_weighted_evaluation_priorities():
 
 
 @pytest.mark.asyncio
+async def test_n13_awkward_candidate_cannot_pass_fluency_threshold():
+    llm = FakeLLMProvider(responses=[{
+        "scores": [{
+            "candidate_id": "C1",
+            "fluency": 10,
+            "recognition": 10,
+            "agu_fit": 10,
+            "humor": 10,
+            "rhythm": 10,
+            "adaptation_restraint": 10,
+            "minimal_replacement_effect": 10,
+            "qualified": True,
+            "reason": "模型认为表达自然",
+        }],
+        "qualified_candidate_ids": ["C1"],
+    }])
+    registry = build_real_registry(llm=llm, search=FakeSearchProvider())
+
+    result = await registry.get("N13").execute({
+        "N05": {"original_text": "我猜中了开头，却猜不中这结局"},
+        "N10": {"canonical_template_text": "我猜中了{开头内容}，却猜不中这{结局内容}"},
+        "N12": {"candidates": [{
+            "candidate_id": "C1",
+            "text": "我猜中了开头，却猜不中这凿agu",
+        }]},
+    }, {
+        "strategy_snapshot": {
+            "generation": {"reject_awkward_demonstrative_phrase": True},
+            "evaluation": {
+                "minimum_fluency": 6,
+                "minimum_recognition": 6,
+                "minimum_agu_fit": 6,
+            },
+        },
+    })
+
+    payload = result["artifact"]["llm"]
+    score = payload["scores"][0]
+    assert result["outcome"] == "ALL_UNQUALIFIED"
+    assert score["fluency"] < 6
+    assert score["qualified"] is False
+    assert payload["qualified_candidate_ids"] == []
+    assert "指示结构不通顺" in "".join(score.get("problems", [])) + score.get("reason", "")
+
+
+@pytest.mark.asyncio
 async def test_n115_builds_fixed_catchphrase_blueprint_without_llm_json_failure():
     llm = FakeLLMProvider()
     registry = build_real_registry(llm=llm, search=FakeSearchProvider())
@@ -1735,6 +1781,43 @@ async def test_n11_revalidates_template_coverage_without_llm_json_failure():
     assert payload["decision"] == "PASS"
     assert payload["matched_variant_count"] == 3
     assert llm.requests == []
+
+
+@pytest.mark.asyncio
+async def test_n11_coverage_threshold_rejects_five_of_twenty_variants():
+    matching = [
+        {"variant_text": f"我猜中了第{i}幕，却猜不中这结局"}
+        for i in range(1, 6)
+    ]
+    nonmatching = [
+        {"variant_text": f"我猜中了第{i}幕，却猜不中这收尾"}
+        for i in range(6, 21)
+    ]
+    registry = build_real_registry(
+        llm=FakeLLMProvider(), search=FakeSearchProvider(),
+    )
+
+    result = await registry.get("N11").execute({
+        "N05": {"original_text": "我猜中了开头，却猜不中这结局"},
+        "N09": {"variants": matching + nonmatching},
+        "N10": {
+            "canonical_template_text": "我猜中了{开头内容}，却猜不中这结局",
+        },
+    }, {
+        "strategy_snapshot": {
+            "search": {"minimum_template_coverage": 0.6},
+        },
+    })
+
+    payload = result["artifact"]["llm"]
+    assert result["outcome"] == "MORE_EVIDENCE"
+    assert payload["decision"] == "MORE_EVIDENCE"
+    assert payload["original_reconstructable"] is True
+    assert payload["matched_variant_count"] == 5
+    assert payload["total_variant_count"] == 20
+    assert payload["coverage"] == pytest.approx(6 / 21)
+    assert payload["accuracy"] < 5
+    assert payload["problems"]
 
 
 @pytest.mark.asyncio

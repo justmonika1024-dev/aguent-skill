@@ -314,6 +314,10 @@ _ACTION_ON_AGU = re.compile(
     rf"(?:给)?凿(?:了|着|过)?(?:一下|一遍|几下)?"
     rf")"
 )
+_AWKWARD_DEMONSTRATIVE_ACTION = re.compile(
+    rf"这\s*凿(?:了|着|过)?(?:一下|一遍|几下)?{_AGU_OBJECT}"
+    rf"(?!\s*的(?:人|事|行为|动作|场面|一幕))"
+)
 _TOOL_PAGE = re.compile(
     r"(?:meme\s*generator|生成器|在线制作|表情包制作|AI.{0,8}文案工具)",
     re.IGNORECASE,
@@ -1262,39 +1266,80 @@ class RealWorkflowNode:
             original = original_node.get("original_text", "") if isinstance(original_node, dict) else ""
             variants = variants_node.get("variants", []) if isinstance(variants_node, dict) else []
             template = template_node.get("canonical_template_text", "") if isinstance(template_node, dict) else ""
-            try:
-                _validate_template(template, original, variants)
-            except ValueError as exc:
-                if "at least two verified variants" not in str(exc):
-                    raise
+            slots = re.findall(r"\{[^{}]+\}", template)
+            fixed = re.sub(r"\{[^{}]+\}", "", template)
+            fixed_chars = re.sub(r"[\s，。！？、；：,.!?;:\"'《》]", "", fixed)
+            pattern = _template_pattern(template)
+            original_reconstructable = bool(
+                slots
+                and len(fixed_chars) >= 4
+                and pattern.fullmatch(_normalize_meme_text(str(original)))
+            )
+            matched = sum(
+                pattern.fullmatch(_normalize_meme_text(
+                    str(variant.get("variant_text", "")).split("。", 1)[0],
+                )) is not None
+                for variant in variants if isinstance(variant, dict)
+            )
+            total = sum(isinstance(variant, dict) for variant in variants)
+            coverage = (
+                matched + int(original_reconstructable)
+            ) / (total + 1)
+            slot_evidence = min(1.0, matched / max(1, len(slots)))
+            accuracy = max(1, min(5, 1 + round(4 * (
+                0.5 * int(original_reconstructable)
+                + 0.35 * coverage
+                + 0.15 * slot_evidence
+            ))))
+            strategy = (
+                services.get("strategy_snapshot", {})
+                if isinstance(services, dict) else {}
+            )
+            search_strategy = strategy.get("search", {}) if isinstance(strategy, dict) else {}
+            minimum_coverage = (
+                search_strategy.get("minimum_template_coverage", 0.6)
+                if isinstance(search_strategy, dict) else 0.6
+            )
+            if (isinstance(minimum_coverage, bool)
+                    or not isinstance(minimum_coverage, (int, float))
+                    or not 0 <= minimum_coverage <= 1):
+                minimum_coverage = 0.6
+            problems: list[str] = []
+            if not slots or len(fixed_chars) < 4:
+                problems.append("模板缺少可复用槽位或有意义的固定结构")
+            if not original_reconstructable:
+                problems.append("模板无法重建原句")
+                decision = "REEXTRACT"
+            elif coverage < minimum_coverage:
+                problems.append(
+                    f"模板覆盖率{coverage:.1%}低于策略门槛{minimum_coverage:.1%}",
+                )
+                decision = "MORE_EVIDENCE"
+            else:
+                decision = "PASS"
+            parsed = {
+                "decision": decision,
+                "original_reconstructable": original_reconstructable,
+                "coverage": coverage,
+                "accuracy": accuracy,
+                "matched_variant_count": matched,
+                "total_variant_count": total,
+                "problems": problems,
+            }
+            artifact = {
+                "llm": parsed,
+                "validation_mode": "DETERMINISTIC_COVERAGE",
+            }
+            if decision == "MORE_EVIDENCE":
                 outcome, fallback = _bounded_variant_fallback(
                     services,
                     str(original),
                     retry_outcome="MORE_EVIDENCE",
                     reason="N11_MORE_EVIDENCE",
                 )
-                return {"outcome": outcome, "artifact": {
-                    "llm": {
-                        "decision": "MORE_EVIDENCE",
-                        "coverage": 0.0,
-                        "accuracy": 0,
-                        "matched_variant_count": 0,
-                        "problems": [str(exc)],
-                    },
-                    "validation_mode": "BOUNDED_MORE_EVIDENCE",
-                    "fallback": fallback,
-                }}
-            pattern = _template_pattern(template)
-            matched = sum(pattern.fullmatch(_normalize_meme_text(str(variant.get("variant_text", "")).split("。", 1)[0])) is not None
-                          for variant in variants)
-            parsed = {
-                "decision": "PASS",
-                "coverage": (matched + 1) / (len(variants) + 1),
-                "accuracy": 5,
-                "matched_variant_count": matched,
-                "problems": [],
-            }
-            return {"outcome": "PASS", "artifact": {"llm": parsed, "validation_mode": "DETERMINISTIC_COVERAGE"}}
+                artifact["fallback"] = fallback
+                return {"outcome": outcome, "artifact": artifact}
+            return {"outcome": decision, "artifact": artifact}
         if self.key == "N11.5" and isinstance(value, dict):
             template_node = value.get("N10", {})
             template_node = template_node.get("llm", template_node) if isinstance(template_node, dict) else {}
@@ -1861,6 +1906,77 @@ class RealWorkflowNode:
                 parsed = N12Output.model_validate({"route_used": route, "candidates": normalized,
                                    "diversity_summary": parsed.get("diversity_summary", ""),
                                    "human_summary": parsed.get("human_summary", "")}).model_dump()
+            elif self.key == "N13":
+                n12 = value.get("N12", {}) if isinstance(value, dict) else {}
+                n12 = n12.get("llm", n12) if isinstance(n12, dict) else {}
+                candidates = n12.get("candidates", []) if isinstance(n12, dict) else []
+                candidate_texts = {
+                    str(candidate.get("candidate_id")): str(candidate.get("text", ""))
+                    for candidate in candidates if isinstance(candidate, dict)
+                }
+                strategy = (
+                    services.get("strategy_snapshot", {})
+                    if isinstance(services, dict) else {}
+                )
+                generation = strategy.get("generation", {}) if isinstance(strategy, dict) else {}
+                evaluation = strategy.get("evaluation", {}) if isinstance(strategy, dict) else {}
+                reject_awkward = (
+                    generation.get("reject_awkward_demonstrative_phrase", True)
+                    if isinstance(generation, dict) else True
+                )
+                thresholds = {
+                    "fluency": evaluation.get("minimum_fluency", 6),
+                    "recognition": evaluation.get("minimum_recognition", 6),
+                    "agu_fit": evaluation.get("minimum_agu_fit", 6),
+                } if isinstance(evaluation, dict) else {
+                    "fluency": 6, "recognition": 6, "agu_fit": 6,
+                }
+                for field, threshold in list(thresholds.items()):
+                    if type(threshold) is not int or not 0 <= threshold <= 10:
+                        thresholds[field] = 6
+                normalized_scores: list[dict[str, Any]] = []
+                qualified_ids: list[str] = []
+                for raw_score in parsed.get("scores", []):
+                    if not isinstance(raw_score, dict):
+                        continue
+                    score = dict(raw_score)
+                    candidate_id = str(score.get("candidate_id", ""))
+                    text = candidate_texts.get(candidate_id, "")
+                    raw_problems = score.get("problems", [])
+                    problems = (
+                        [raw_problems] if isinstance(raw_problems, str)
+                        else [str(problem) for problem in raw_problems]
+                        if isinstance(raw_problems, list) else []
+                    )
+                    if reject_awkward and _AWKWARD_DEMONSTRATIVE_ACTION.search(text):
+                        fluency_cap = max(0, thresholds["fluency"] - 1)
+                        fluency = score.get("fluency")
+                        if (not isinstance(fluency, (int, float))
+                                or isinstance(fluency, bool)):
+                            fluency = fluency_cap
+                        score["fluency"] = min(fluency, fluency_cap)
+                        problems.append("指示结构不通顺：这不能直接修饰裸动作短语凿agu")
+                    if not _ACTION_ON_AGU.search(text):
+                        agu_fit_cap = max(0, thresholds["agu_fit"] - 1)
+                        agu_fit = score.get("agu_fit")
+                        if (not isinstance(agu_fit, (int, float))
+                                or isinstance(agu_fit, bool)):
+                            agu_fit = agu_fit_cap
+                        score["agu_fit"] = min(agu_fit, agu_fit_cap)
+                        problems.append("动宾关系不成立：凿的动作受事必须是agu")
+                    score["problems"] = list(dict.fromkeys(problems))
+                    score["qualified"] = bool(score.get("qualified")) and all(
+                        isinstance(score.get(field), (int, float))
+                        and not isinstance(score.get(field), bool)
+                        and score[field] >= threshold
+                        for field, threshold in thresholds.items()
+                    )
+                    if score["qualified"] and candidate_id in candidate_texts:
+                        qualified_ids.append(candidate_id)
+                    normalized_scores.append(score)
+                parsed["scores"] = normalized_scores
+                parsed["qualified_candidate_ids"] = list(dict.fromkeys(qualified_ids))
+                outcome = "HAS_QUALIFIED" if qualified_ids else "ALL_UNQUALIFIED"
             elif self.key == "N14":
                 selected = parsed.get("selected_candidate_id", parsed.get("selected_id"))
                 n12 = value.get("N12", {}) if isinstance(value, dict) else {}
