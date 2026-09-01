@@ -18,25 +18,57 @@ def test_node_contracts_are_strict_and_n12_has_five_fixed_candidates():
                   human_summary="x", unknown="bad")
 
 
-def test_evaluation_requires_exact_candidate_set_and_valid_scores():
-    base = dict(fluency=4, original_meme_recognition=4, agu_zao_naturalness=4,
-                humor=4, template_logic=4, usability="USABLE", modification_advice="")
-    payload = dict(expected_run_version=1, branch_id="b", processing_chain={
-        "original_meme_popularity": 4, "original_meme_applicability": 4,
-        "search_result_relevance": 4, "variant_evidence_quality": 4,
-        "template_extraction_accuracy": 4, "overall_chain_reasonableness": 4, "comment": ""},
-        candidate_set={"effective_difference": 4, "natural_rewrite_coverage": 4,
-                       "overall_selectable_quality": 4, "comment": ""},
-        candidates={f"C{i}": base for i in range(1, 6)},
-        final_result={"is_best_candidate": True, "better_candidate_id": None, "fluency": 4,
-                      "original_meme_recognition": 4, "agu_zao_fit": 4, "humor": 4,
-                      "overall_satisfaction": 4, "comment": ""},
-        main_problem_nodes=["NO_OBVIOUS_PROBLEM"],
-        admission={"decision": "ADMIT", "override": None, "reason": "ok"}, overall_comment="")
-    request = HumanEvaluationRequest(**payload)
-    assert set(request.candidates) == {"C1", "C2", "C3", "C4", "C5"}
+def module_score(**values):
+    return {**values, "comment": ""}
+
+
+def valid_evaluation_payload():
+    candidate = {
+        "fluency": 4, "original_meme_recognition": 4,
+        "agu_zao_naturalness": 4, "humor": 4, "template_logic": 4,
+        "usability": "USABLE", "modification_advice": "",
+    }
+    return {
+        "expected_run_version": 1, "branch_id": "b1",
+        "original_search_plan": module_score(anchor_accuracy=4, query_coverage=4, plan_targeting=4),
+        "selected_original_meme": module_score(popularity=4, applicability=4, adaptability=4, evidence_reliability=4),
+        "variant_search_plan": module_score(slot_replacement_targeting=4, query_diversity=4, ugc_orientation=4, noise_avoidance=4),
+        "variant_search_results": module_score(relevance=4, real_variant_ratio=4, independent_evidence_quality=4, variant_diversity=4),
+        "template_extraction": module_score(accuracy=4, original_reconstruction=4, variant_coverage=4, slot_rationality=4),
+        "candidate_generation": {
+            "overall": module_score(effective_difference=4, natural_rewrite_coverage=4, overall_selectable_quality=4),
+            "candidates": {f"C{i}": candidate for i in range(1, 6)},
+        },
+        "final_result": {
+            "is_best_candidate": True, "better_candidate_id": None,
+            "fluency": 4, "original_meme_recognition": 4, "agu_zao_fit": 4,
+            "humor": 4, "overall_satisfaction": 4, "comment": "",
+        },
+        "main_problem_nodes": ["NO_OBVIOUS_PROBLEM"],
+        "admission": {"decision": "ADMIT", "override": None, "reason": ""},
+        "overall_comment": "",
+    }
+
+
+def test_evaluation_requires_all_seven_modules_but_allows_empty_text_feedback():
+    request = HumanEvaluationRequest(**valid_evaluation_payload())
+    assert request.variant_search_results.comment == ""
+    assert request.candidate_generation.candidates["C1"].modification_advice == ""
+
+
+@pytest.mark.parametrize("score", [0, 6])
+def test_evaluation_rejects_scores_outside_one_to_five(score):
+    payload = valid_evaluation_payload()
+    payload["original_search_plan"]["anchor_accuracy"] = score
     with pytest.raises(ValidationError):
-        HumanEvaluationRequest(**{**payload, "candidates": {"C1": base}})
+        HumanEvaluationRequest(**payload)
+
+
+def test_evaluation_requires_exact_candidate_set():
+    payload = valid_evaluation_payload()
+    payload["candidate_generation"]["candidates"] = {"C1": payload["candidate_generation"]["candidates"]["C1"]}
+    with pytest.raises(ValidationError):
+        HumanEvaluationRequest(**payload)
 
 
 def test_metadata_contains_run_and_meme_archive_tables():
