@@ -915,7 +915,36 @@ def _invalid_agu_identity(text: str) -> bool:
     return bool(re.search(r"agu是.{0,12}(游戏|作品|计划|身份|设定)", without_action))
 
 
+def _has_coordinated_other_object(text: str) -> bool:
+    independent_predicate = re.compile(
+        r"^(?:我|你|他|她|我们|你们|他们|她们|群友|大家|小[\u4e00-\u9fff]{1,3})"
+        r"(?:也|正|正在|已经|还在)?"
+        r"(?:聊天|回家|离开|说话|休息|吃饭|工作|学习|开始|继续|结束)"
+    )
+    discourse_starter = re.compile(
+        r"^(?:然后|随后|接着|后来|再|又|并且|但是|但|却|而|于是|所以)"
+    )
+    for action in _ACTION_ON_AGU.finditer(text):
+        coordinated = re.match(
+            r"\s*(?:和|与|及|、|，|,)\s*([^。！？!?；;]*)",
+            text[action.end():],
+        )
+        if coordinated is None:
+            continue
+        phrase = coordinated.group(1).strip()
+        if not phrase:
+            continue
+        if (discourse_starter.search(phrase)
+                or independent_predicate.search(phrase)
+                or _ACTION_ON_AGU.search(phrase)):
+            continue
+        return True
+    return False
+
+
 def _has_action_on_other_object(text: str) -> bool:
+    if _has_coordinated_other_object(text):
+        return True
     remaining = _ACTION_ON_AGU.sub("", text)
     for match in re.finditer("凿", remaining):
         tail = re.split(
