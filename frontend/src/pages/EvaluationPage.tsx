@@ -1,4 +1,4 @@
-import { ArrowLeftOutlined, SendOutlined } from '@ant-design/icons'
+import { ArrowLeftOutlined, ReloadOutlined, SendOutlined } from '@ant-design/icons'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { Alert, Button, Card, Form, Input, Radio, Select, Space, Spin, Typography, message } from 'antd'
 import { useNavigate, useParams } from 'react-router-dom'
@@ -47,18 +47,37 @@ export function EvaluationPage() {
   const selectionArtifact = latestNodeArtifact(nodes, 'N14', activeBranchId, branches)
   const candidates = candidateArtifacts([{ node_key: 'N12', output: candidateArtifact }])
   const selected = selectedCandidateId([{ node_key: 'N14', output: selectionArtifact }])
+  const selectedCandidate = candidateIds.find((candidateId) => candidateId === selected)
+  const betterCandidateOptions = selectedCandidate
+    ? candidateIds
+      .filter((candidateId) => candidateId !== selectedCandidate)
+      .map((candidateId) => ({ label: candidateId, value: candidateId }))
+    : []
   const mode = snapshot.data?.admission_mode ?? record.data?.run.admission_mode ?? 'HUMAN'
 
   const submit = useMutation({
-    mutationFn: (values: EvaluationFormValues) => api.post(
-      `/runs/${runId}/evaluation`,
-      buildEvaluationPayload(
-        values,
-        mode,
-        snapshot.data!.run_version!,
-        activeBranchId,
-      ),
-    ),
+    mutationFn: (values: EvaluationFormValues) => {
+      const liveSnapshot = snapshot.data
+      if (
+        liveSnapshot?.run_id !== runId
+        || liveSnapshot.state !== 'WAITING_HUMAN_EVALUATION'
+        || typeof liveSnapshot.run_version !== 'number'
+        || !Number.isInteger(liveSnapshot.run_version)
+        || liveSnapshot.run_version < 0
+        || !liveSnapshot.active_branch_id
+      ) {
+        return Promise.reject(new Error('历史任务无法继续评价'))
+      }
+      return api.post(
+        `/runs/${runId}/evaluation`,
+        buildEvaluationPayload(
+          values,
+          mode,
+          liveSnapshot.run_version,
+          liveSnapshot.active_branch_id,
+        ),
+      )
+    },
     onSuccess: async () => {
       await apiMessage.success('评价已提交，反馈将影响下一轮策略')
       await queryClient.invalidateQueries({ queryKey: queryKeys.runRecord(runId) })
@@ -76,9 +95,14 @@ export function EvaluationPage() {
 
   const handleFinish = (values: EvaluationFormValues) => {
     const finalResult = values.final_result
+    const hasDifferentReplacement = Boolean(
+      selectedCandidate
+      && finalResult.better_candidate_id
+      && finalResult.better_candidate_id !== selectedCandidate,
+    )
     if (
       finalResult.is_best_candidate === false
-      && !finalResult.better_candidate_id
+      && !hasDifferentReplacement
       && !finalResult.comment?.trim()
     ) {
       form.setFields([{
@@ -88,7 +112,13 @@ export function EvaluationPage() {
       return
     }
     form.setFields([{ name: ['final_result', 'comment'], errors: [] }])
-    submit.mutate(values)
+    submit.mutate({
+      ...values,
+      final_result: {
+        ...finalResult,
+        better_candidate_id: hasDifferentReplacement ? finalResult.better_candidate_id : undefined,
+      },
+    })
   }
 
   const normalizeProblemNodes = (values: string[]) => {
@@ -102,11 +132,48 @@ export function EvaluationPage() {
   if (record.isLoading || snapshot.isLoading) {
     return <Spin tip="加载评价材料"><div className="loading-space" /></Spin>
   }
-  if (!record.data || !snapshot.data) {
+  const recoveryActions = <Space wrap>
+    <Button
+      icon={<ReloadOutlined />}
+      onClick={() => { void Promise.all([record.refetch(), snapshot.refetch()]) }}
+    >重试加载</Button>
+    <Button onClick={() => navigate(`/runs/${runId}`)}>返回运行详情</Button>
+  </Space>
+  if (record.error || !record.data) {
     return <Alert
       type="error"
+      showIcon
       message="无法加载评价材料"
-      description={(record.error as Error)?.message ?? (snapshot.error as Error)?.message}
+      description={(record.error as Error)?.message ?? '运行记录不可用'}
+      action={recoveryActions}
+    />
+  }
+  const snapshotNotFound = snapshot.error instanceof ApiError && snapshot.error.status === 404
+  if (snapshot.error) {
+    if (record.data.run.state === 'WAITING_HUMAN_EVALUATION' && snapshotNotFound) {
+      return <Alert
+        type="warning"
+        showIcon
+        message="历史任务无法继续评价"
+        description="该任务仅保留历史运行记录，当前服务中已无可提交的实时状态。"
+        action={recoveryActions}
+      />
+    }
+    return <Alert
+      type="error"
+      showIcon
+      message="无法加载评价材料"
+      description={(snapshot.error as Error).message}
+      action={recoveryActions}
+    />
+  }
+  if (!snapshot.data) {
+    return <Alert
+      type="error"
+      showIcon
+      message="无法加载评价材料"
+      description="实时运行状态不可用"
+      action={recoveryActions}
     />
   }
   if (snapshot.data.state !== 'WAITING_HUMAN_EVALUATION') {
@@ -115,6 +182,20 @@ export function EvaluationPage() {
       showIcon
       message="当前任务不在等待评价状态"
       action={<Button onClick={() => navigate(`/runs/${runId}`)}>返回详情</Button>}
+    />
+  }
+  const hasValidLiveSnapshot = snapshot.data.run_id === runId
+    && typeof snapshot.data.run_version === 'number'
+    && Number.isInteger(snapshot.data.run_version)
+    && snapshot.data.run_version >= 0
+    && Boolean(snapshot.data.active_branch_id)
+  if (!hasValidLiveSnapshot) {
+    return <Alert
+      type="warning"
+      showIcon
+      message="历史任务无法继续评价"
+      description="该任务缺少可提交的实时版本或活动分支，请返回运行详情查看历史材料。"
+      action={recoveryActions}
     />
   }
 
@@ -245,9 +326,13 @@ export function EvaluationPage() {
           )}
         >
           {({ getFieldValue }) => getFieldValue(['final_result', 'is_best_candidate']) === false
-            ? <Form.Item name={['final_result', 'better_candidate_id']} label="更合适候选（选填）">
-              <Select allowClear options={candidateIds.map((id) => ({ label: id, value: id }))} />
-            </Form.Item>
+            ? selectedCandidate
+              ? <Form.Item name={['final_result', 'better_candidate_id']} label="更合适候选（选填）">
+                <Select allowClear options={betterCandidateOptions} />
+              </Form.Item>
+              : <Typography.Paragraph type="warning">
+                未识别到 Agent 当前选择，请填写最终结果意见。
+              </Typography.Paragraph>
             : null}
         </Form.Item>
       </EvaluationModuleCard>

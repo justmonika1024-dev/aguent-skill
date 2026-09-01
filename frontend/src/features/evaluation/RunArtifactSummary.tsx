@@ -369,7 +369,12 @@ export function RunArtifactSummary({
   activeBranchId: string
   branches?: readonly ArtifactBranch[]
 }) {
-  return <div className="run-artifact-summary">{nodeKeys.map((nodeKey) => {
+  return <div
+    className="run-artifact-summary"
+    role="region"
+    aria-label={`${nodeKeys.join('、')} 节点材料`}
+    tabIndex={0}
+  >{nodeKeys.map((nodeKey) => {
     const artifact = latestNodeArtifact(nodes, nodeKey, activeBranchId, branches)
     return <section className="run-artifact-node" data-node-key={nodeKey} key={nodeKey}>
       <Typography.Title level={5}>{nodeKey}</Typography.Title>

@@ -26,10 +26,15 @@ const nodes = [
 function mockEvaluationApi(
   admissionMode: 'HUMAN' | 'AUTO' = 'HUMAN',
   evaluationResponse: () => Response = () => new Response('{}'),
+  overrides: {
+    snapshotResponse?: () => Response
+    recordResponse?: () => Response
+    nodes?: typeof nodes
+  } = {},
 ) {
   const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input)
-    if (url.endsWith('/record')) return new Response(JSON.stringify({
+    if (url.endsWith('/record')) return overrides.recordResponse?.() ?? new Response(JSON.stringify({
       run: {
         run_id: 'r1',
         mode: 'MANUAL_SEED',
@@ -42,10 +47,10 @@ function mockEvaluationApi(
       events: [],
       api_calls: [],
       evaluations: [],
-      nodes,
+      nodes: overrides.nodes ?? nodes,
     }))
     if (url.endsWith('/evaluation')) return evaluationResponse()
-    return new Response(JSON.stringify({
+    return overrides.snapshotResponse?.() ?? new Response(JSON.stringify({
       run_id: 'r1',
       run_version: 17,
       mode: 'MANUAL_SEED',
@@ -121,6 +126,62 @@ it('shows the seven evaluation modules in workflow order', async () => {
   for (let index = 1; index < titleElements.length; index += 1) {
     expect(titleElements[index - 1].compareDocumentPosition(titleElements[index]) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
   }
+})
+
+it.each([
+  {
+    caseName: 'the live snapshot has no valid run version',
+    snapshotResponse: () => new Response(JSON.stringify({
+      run_id: 'r1',
+      mode: 'MANUAL_SEED',
+      state: 'WAITING_HUMAN_EVALUATION',
+      admission_mode: 'HUMAN',
+      active_branch_id: 'b1',
+    })),
+  },
+  {
+    caseName: 'the backend no longer has the run in memory',
+    snapshotResponse: () => new Response(JSON.stringify({ detail: 'Run not found' }), { status: 404 }),
+  },
+])('blocks historical waiting evaluation when $caseName', async ({ snapshotResponse }) => {
+  const fetchMock = mockEvaluationApi('HUMAN', undefined, { snapshotResponse })
+  renderEvaluationPage()
+
+  expect(await screen.findByText('历史任务无法继续评价')).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: '返回运行详情' })).toBeInTheDocument()
+  expect(screen.queryByRole('button', { name: '提交评价' })).not.toBeInTheDocument()
+  expect(postCalls(fetchMock)).toHaveLength(0)
+})
+
+it.each([
+  { caseName: 'record', failedSuffix: '/record' },
+  { caseName: 'snapshot', failedSuffix: '/runs/r1' },
+])('offers retry and return actions when the $caseName request fails', async ({ failedSuffix }) => {
+  let attempts = 0
+  const failedResponse = () => {
+    attempts += 1
+    return new Response(JSON.stringify({ detail: 'temporary failure' }), { status: 500 })
+  }
+  const fetchMock = failedSuffix === '/record'
+    ? mockEvaluationApi('HUMAN', undefined, { recordResponse: failedResponse })
+    : mockEvaluationApi('HUMAN', undefined, { snapshotResponse: failedResponse })
+  renderEvaluationPage()
+
+  expect(await screen.findByText('无法加载评价材料')).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: '返回运行详情' })).toBeInTheDocument()
+  await userEvent.setup().click(screen.getByRole('button', { name: /重试加载/ }))
+
+  await waitFor(() => expect(fetchMock.mock.calls.filter(([input]) => String(input).endsWith(failedSuffix))).toHaveLength(2))
+  expect(attempts).toBe(2)
+})
+
+it('makes each bounded artifact summary keyboard reachable', async () => {
+  mockEvaluationApi()
+  renderEvaluationPage()
+
+  const summaries = await screen.findAllByRole('region', { name: /节点材料/ })
+  expect(summaries).toHaveLength(7)
+  for (const summary of summaries) expect(summary).toHaveAttribute('tabindex', '0')
 })
 
 it('marks missing structured fields and does not post an empty form', async () => {
@@ -205,6 +266,37 @@ it('requires a final comment only when a non-best result has no replacement cand
     better_candidate_id: 'C1',
     comment: '',
   })
+}, 15_000)
+
+it('does not offer the agent-selected candidate as its own replacement', async () => {
+  mockEvaluationApi()
+  renderEvaluationPage()
+  await screen.findByText('人工结构化评价')
+  const user = userEvent.setup()
+  await user.click(screen.getByLabelText('否'))
+
+  await user.click(screen.getByLabelText('更合适候选（选填）'))
+
+  const options = Array.from(document.querySelectorAll<HTMLElement>('.ant-select-item-option-content'))
+    .map((option) => option.textContent)
+  expect(options).toEqual(['C1', 'C3', 'C4', 'C5'])
+}, 15_000)
+
+it('requires a comment without offering replacements when N14 has no selected candidate', async () => {
+  const fetchMock = mockEvaluationApi('HUMAN', undefined, {
+    nodes: nodes.filter((node) => node.node_key !== 'N14'),
+  })
+  const { container } = renderEvaluationPage()
+  await screen.findByText('人工结构化评价')
+  await fillAllRequiredSelections(container)
+  const user = userEvent.setup()
+  await user.click(screen.getByLabelText('否'))
+
+  expect(screen.queryByLabelText('更合适候选（选填）')).not.toBeInTheDocument()
+  await user.click(screen.getByRole('button', { name: '提交评价' }))
+
+  expect(await screen.findByText('未选择更合适候选时，请说明最终结果的问题')).toBeInTheDocument()
+  expect(postCalls(fetchMock)).toHaveLength(0)
 }, 15_000)
 
 it('lets a concrete problem replace NO_OBVIOUS_PROBLEM so both values never coexist', async () => {
