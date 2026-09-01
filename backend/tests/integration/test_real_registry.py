@@ -76,6 +76,90 @@ def test_low_variant_scores_force_search_quality_patch():
     assert any("原句转载" in str(op["value"]) for op in operations)
 
 
+@pytest.mark.asyncio
+async def test_n19_patch_recursively_scores_full_candidate_generation_module():
+    evaluation = {
+        "original_search_plan": {
+            "anchor_accuracy": 5, "query_coverage": 5, "plan_targeting": 5,
+            "comment": "",
+        },
+        "selected_original_meme": {
+            "popularity": 5, "applicability": 5, "adaptability": 5,
+            "evidence_reliability": 5, "comment": "",
+        },
+        "variant_search_plan": {
+            "slot_replacement_targeting": 5, "query_diversity": 5,
+            "ugc_orientation": 5, "noise_avoidance": 5, "comment": "",
+        },
+        "variant_search_results": {
+            "relevance": 5, "real_variant_ratio": 5,
+            "independent_evidence_quality": 5, "variant_diversity": 5,
+            "comment": "",
+        },
+        "template_extraction": {
+            "accuracy": 5, "original_reconstruction": 5,
+            "variant_coverage": 5, "slot_rationality": 5, "comment": "",
+        },
+        "candidate_generation": {
+            "overall": {
+                "effective_difference": 3, "natural_rewrite_coverage": 5,
+                "overall_selectable_quality": 5, "comment": "候选差异不足",
+            },
+            "candidates": {
+                "C1": {
+                    "fluency": 2, "original_meme_recognition": 5,
+                    "agu_zao_naturalness": 5, "humor": 5, "template_logic": 5,
+                    "usability": "USABLE_AFTER_EDIT", "modification_advice": "改善语序",
+                },
+                "C2": {
+                    "fluency": 5, "original_meme_recognition": 5,
+                    "agu_zao_naturalness": 5, "humor": 5, "template_logic": 5,
+                    "usability": "USABLE", "modification_advice": "",
+                },
+                "C3": {
+                    "fluency": 5, "original_meme_recognition": 5,
+                    "agu_zao_naturalness": 5, "humor": 5, "template_logic": 5,
+                    "usability": "USABLE", "modification_advice": "",
+                },
+                "C4": {
+                    "fluency": 5, "original_meme_recognition": 5,
+                    "agu_zao_naturalness": 5, "humor": 5, "template_logic": 5,
+                    "usability": "USABLE", "modification_advice": "",
+                },
+                "C5": {
+                    "fluency": 5, "original_meme_recognition": 5,
+                    "agu_zao_naturalness": 5, "humor": 5, "template_logic": 5,
+                    "usability": "USABLE", "modification_advice": "",
+                },
+            },
+        },
+        "final_result": {
+            "is_best_candidate": True, "better_candidate_id": None,
+            "fluency": 5, "original_meme_recognition": 5, "agu_zao_fit": 5,
+            "humor": 5, "overall_satisfaction": 5, "comment": "",
+        },
+    }
+    registry = build_real_registry(
+        llm=FakeLLMProvider(responses=[{
+            "feedback_summary": "候选质量需改进",
+            "affected_nodes": [],
+            "patch_operations": [],
+            "score_gaps": {},
+            "next_round_hypotheses": [],
+        }]),
+        search=FakeSearchProvider(),
+    )
+
+    result = await registry.get("N19").execute({"N18": evaluation}, None)
+    artifact = result["artifact"]
+
+    assert artifact["score_gaps"] == {
+        "candidate_generation.overall.effective_difference": 1,
+        "candidate_generation.candidates.C1.fluency": 2,
+    }
+    assert artifact["affected_nodes"] == ["N12", "N13", "N14"]
+
+
 def test_patch_operations_merge_llm_advice_with_whitelist_deduplication_and_text_limit():
     long_advice = "优先网友槽位改编" * 100
     evaluation = {
@@ -124,6 +208,30 @@ def test_patch_operations_merge_llm_advice_with_whitelist_deduplication_and_text
         and "模板覆盖不足" in str(op["value"])
         for op in operations
     )
+
+
+def test_llm_patch_cannot_relax_quality_thresholds_or_protection_switches():
+    llm_patch = [
+        {"op": "replace", "path": "/search/minimum_valid_variants", "value": 1},
+        {"op": "replace", "path": "/search/minimum_template_coverage", "value": 0},
+        {"op": "replace", "path": "/search/max_variant_search_retries", "value": 10},
+        {"op": "replace", "path": "/search/exclude_exact_reprints", "value": False},
+        {"op": "replace", "path": "/search/require_slot_replacement", "value": False},
+        {"op": "replace", "path": "/generation/prefer_minimal_replacement", "value": False},
+        {
+            "op": "add",
+            "path": "/search/variant_query_directives/-",
+            "value": "优先独立网友槽位改编",
+        },
+    ]
+
+    operations = derive_required_patch_operations({}, llm_patch)
+
+    assert operations == [{
+        "op": "add",
+        "path": "/search/variant_query_directives/-",
+        "value": "优先独立网友槽位改编",
+    }]
 
 
 @pytest.mark.asyncio

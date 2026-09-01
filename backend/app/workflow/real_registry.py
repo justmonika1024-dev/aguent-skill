@@ -56,8 +56,8 @@ _INSTRUCTIONS = {
     "N15": "生成正式梗包装。final_agu_text必须逐字等于N14选中的N12候选；输出title(4到40字)、normalized_title、final_agu_text、original、template、source_url。",
     "N19": (
         "根据七模块人工评价输出下一轮策略反馈。必须输出feedback_summary、affected_nodes、"
-        "patch_operations、score_gaps、next_round_hypotheses。patch_operations只能建议add或replace，"
-        "不得修改预算、安全、候选数量或路由。"
+        "patch_operations、score_gaps、next_round_hypotheses。patch_operations只能用add向现有"
+        "directive数组追加文字建议，不得修改阈值、质量开关、预算、安全、候选数量或路由。"
     ),
 }
 
@@ -66,20 +66,8 @@ _MAX_FEEDBACK_TEXT_LENGTH = 300
 _ALLOWED_PATCH_PATHS = {
     "/search/discovery_directives/-",
     "/search/variant_query_directives/-",
-    "/search/prefer_ugc_sources",
-    "/search/exclude_exact_reprints",
-    "/search/require_slot_replacement",
-    "/search/max_variant_search_retries",
-    "/search/minimum_valid_variants",
-    "/search/minimum_independent_variant_sources",
-    "/search/minimum_template_coverage",
     "/generation/directives/-",
-    "/generation/prefer_minimal_replacement",
-    "/generation/reject_awkward_demonstrative_phrase",
     "/evaluation/directives/-",
-    "/evaluation/minimum_fluency",
-    "/evaluation/minimum_recognition",
-    "/evaluation/minimum_agu_fit",
     "/admission/directives/-",
 }
 _EVALUATION_NODE_MAP = {
@@ -104,12 +92,16 @@ def _safe_feedback_text(value: Any) -> str:
 
 def _score_gaps(evaluation: dict[str, Any]) -> dict[str, int]:
     gaps: dict[str, int] = {}
-    for module, scores in evaluation.items():
-        if not isinstance(scores, dict):
-            continue
-        for field, score in scores.items():
-            if field != "comment" and type(score) is int and 1 <= score < 4:
-                gaps[f"{module}.{field}"] = 4 - score
+
+    def collect(value: Any, path: tuple[str, ...]) -> None:
+        if isinstance(value, dict):
+            for field, child in value.items():
+                collect(child, (*path, str(field)))
+        elif type(value) is int and 1 <= value < 4:
+            gaps[".".join(path)] = 4 - value
+
+    for module in _EVALUATION_NODE_MAP:
+        collect(evaluation.get(module), (module,))
     return gaps
 
 

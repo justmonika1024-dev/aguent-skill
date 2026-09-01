@@ -150,11 +150,20 @@ async def test_next_round_strategy_is_applied_before_second_n07(tmp_path):
             .where(RunNodeExecution.node_key == "N07")
             .order_by(RunNodeExecution.attempt_no)
         )).scalars().all()
+        n19_execution = await session.scalar(
+            select(RunNodeExecution)
+            .where(RunNodeExecution.run_id == context.run_id)
+            .where(RunNodeExecution.node_key == "N19")
+        )
     assert len(n07_executions) == 2
     assert n07_executions[-1].strategy_version_id == context.strategy_version_id
     assert n07_executions[-1].output_json["applied_directives"] == [
         "排除原句转载，优先搜索网友槽位改编",
     ]
+    assert n19_execution is not None
+    assert n19_execution.strategy_version_id == before_version_id
+    assert n19_execution.output_json["before_strategy_version_id"] == before_version_id
+    assert n19_execution.output_json["after_strategy_version_id"] == context.strategy_version_id
 
     await engine.command(context.run_id, Command(
         "TERMINATE", expected_run_version=context.run_version,

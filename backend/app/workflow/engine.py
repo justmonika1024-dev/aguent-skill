@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from copy import copy
 from typing import Any
 from uuid import uuid4
 
@@ -287,8 +288,14 @@ class WorkflowEngine:
                 context.node_outputs[node] = output
                 context.active_artifacts[node] = output
                 if self.repository and node != "START":
+                    persistence_context = context
+                    if node == "N19" and isinstance(output, dict):
+                        before_version_id = output.get("before_strategy_version_id")
+                        if isinstance(before_version_id, str):
+                            persistence_context = copy(context)
+                            persistence_context.strategy_version_id = before_version_id
                     await self.repository.persist_node(
-                        context,
+                        persistence_context,
                         node,
                         output,
                         outcome,
