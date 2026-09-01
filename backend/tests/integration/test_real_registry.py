@@ -757,18 +757,73 @@ async def test_auto_discovery_exhausted_original_is_not_selected_again():
     )
 
     assert n02["artifact"]["llm"]["known_example_phrases"] == [alternative]
-    assert llm.requests[0].user_payload["excluded_originals"] == [exhausted]
+    assert llm.requests[0].user_payload["excluded_originals"] == [
+        "我猜中了开头,却猜不中这结局",
+    ]
 
     n05 = await registry.get("N05").execute({
         "N02": n02["artifact"],
         "N04": {"sources": [source]},
     }, services)
 
-    assert n05["outcome"] == "ABANDON_ORIGINAL"
-    assert n05["artifact"]["rejection_reason"] == "EXHAUSTED_ORIGINAL_RESELECTED"
+    assert n05["outcome"] == "HUMAN_REVIEW_REQUIRED"
+    assert n05["artifact"]["rejection_reason"] == "ONLY_EXHAUSTED_ORIGINAL_EVIDENCE"
+    assert len(llm.requests) == 1
     assert TransitionTable().next(
         "N05", n05["outcome"], mode=RunMode.AUTO_DISCOVERY.value,
-    ) == "N02"
+    ) == "WAITING_HUMAN_INTERVENTION"
+
+
+@pytest.mark.asyncio
+async def test_auto_repeated_discovery_cycles_stop_before_n05_on_exhausted_evidence():
+    exhausted = "万万没想到事情竟然会变成这样"
+    traditional = "萬萬沒想到事情竟然會變成這樣"
+    alternative = "大胆妖孽，我一眼就看出你不是人"
+    context = RunContext(
+        mode=RunMode.AUTO_DISCOVERY,
+        admission_mode=AdmissionMode.AUTO,
+        strategy_snapshot={"search": {}},
+        exhausted_originals=[exhausted],
+    )
+    services = {"strategy_snapshot": context.strategy_snapshot}
+    llm = FakeLLMProvider(responses=[
+        {"known_example_phrases": [traditional, alternative]},
+        {"known_example_phrases": [traditional, alternative]},
+    ])
+    repeated_source = SearchResult(
+        url="https://forum.example/repeated",
+        canonical_url="https://forum.example/repeated",
+        title="原句转载",
+        text=f"帖子里写道，{traditional}，围观的人都笑了",
+    )
+    search = FakeSearchProvider(batches=[
+        SearchBatch(results=[repeated_source]),
+        SearchBatch(results=[repeated_source]),
+    ])
+    registry = build_real_registry(llm=llm, search=search)
+
+    for _ in range(2):
+        n02 = await registry.get("N02").execute(
+            {"START": {"mode": "AUTO_DISCOVERY"}}, services,
+        )
+        assert n02["artifact"]["llm"]["known_example_phrases"] == [alternative]
+        n04 = await registry.get("N04").execute({
+            "N03": {"queries": [{
+                "query_id": "OQ1",
+                "query": traditional,
+                "search_type": "keyword",
+            }]},
+        }, services)
+        assert n04["outcome"] == "HUMAN_REVIEW_REQUIRED"
+        assert n04["artifact"]["sources"] == []
+        assert n04["artifact"]["rejection_reason"] == (
+            "ONLY_EXHAUSTED_ORIGINAL_EVIDENCE"
+        )
+        assert TransitionTable().next(
+            "N04", n04["outcome"], mode=RunMode.AUTO_DISCOVERY.value,
+        ) == "WAITING_HUMAN_INTERVENTION"
+
+    assert len(llm.requests) == 2
 
 
 @pytest.mark.asyncio
@@ -910,6 +965,29 @@ def test_substantive_variant_filter_rejects_unmapped_traditional_reprint():
         "這個網絡熱門話題總是讓人意想不到",
         ["网络热门话题", "让人意想不到"],
     ) is False
+
+
+@pytest.mark.parametrize(("candidate", "expected"), [
+    ("萬萬沒想到事情竟然會變成這樣", False),
+    ("萬万没想到事情竟然会變成这样", False),
+    ("帖子里写道，萬萬沒想到事情竟然會變成這樣，围观的人都笑了", False),
+    ("萬萬沒想到群友竟然會把agu凿成這樣", True),
+])
+def test_traditional_and_mixed_glyph_variants_share_one_canonical_comparison(
+    candidate, expected,
+):
+    assert real_registry.is_substantive_variant(
+        "万万没想到事情竟然会变成这样",
+        candidate,
+        ["万万没想到", "竟然会变成这样"],
+    ) is expected
+
+
+def test_traditional_equivalent_original_is_an_exact_duplicate():
+    assert real_registry._duplicate_similarity(
+        "万万没想到事情竟然会变成这样",
+        "萬萬沒想到事情竟然會變成這樣",
+    ) == 1.0
 
 
 @pytest.mark.asyncio
@@ -1679,8 +1757,10 @@ async def test_n09_and_n11_share_two_variant_search_retries_per_original():
         "threshold": 2,
         "reason": "N09_INSUFFICIENT_VARIANTS",
     }
-    assert context.loop_counters[f"variant_search:{original}"] == 2
-    assert context.snapshot()["loop_counters"] == {f"variant_search:{original}": 2}
+    assert context.loop_counters["variant_search:我猜中了开头,却猜不中这结局"] == 2
+    assert context.snapshot()["loop_counters"] == {
+        "variant_search:我猜中了开头,却猜不中这结局": 2,
+    }
 
 
 @pytest.mark.asyncio
@@ -1694,7 +1774,7 @@ async def test_exhausted_original_tracking_keeps_other_original_counter_isolated
     )
     context.__dict__["exhausted_originals"] = []
     context.strategy_snapshot.exhausted_originals = context.exhausted_originals
-    context.loop_counters[f"variant_search:{exhausted}"] = 2
+    context.loop_counters["variant_search:我猜中了开头,却猜不中这结局"] = 2
     services = {"strategy_snapshot": context.strategy_snapshot}
     registry = build_real_registry(llm=FailingLLM(), search=FakeSearchProvider())
 
@@ -1709,12 +1789,49 @@ async def test_exhausted_original_tracking_keeps_other_original_counter_isolated
 
     assert exhausted_result["outcome"] == "ABANDON_ORIGINAL"
     assert different_result["outcome"] == "INSUFFICIENT"
-    assert context.exhausted_originals == [exhausted]
+    assert context.exhausted_originals == ["我猜中了开头,却猜不中这结局"]
     assert context.loop_counters == {
-        f"variant_search:{exhausted}": 2,
-        f"variant_search:{different}": 1,
+        "variant_search:我猜中了开头,却猜不中这结局": 2,
+        "variant_search:大胆妖孽,我一眼就看出你不是人": 1,
     }
-    assert context.snapshot()["exhausted_originals"] == [exhausted]
+    assert context.snapshot()["exhausted_originals"] == [
+        "我猜中了开头,却猜不中这结局",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_variant_retry_counter_uses_one_key_for_traditional_spellings():
+    simplified = "万万没想到事情竟然会变成这样"
+    traditional = "萬萬沒想到事情竟然會變成這樣"
+    mixed = "萬万没想到事情竟然会變成这样"
+    context = RunContext(
+        mode=RunMode.AUTO_DISCOVERY,
+        admission_mode=AdmissionMode.AUTO,
+        strategy_snapshot={"search": {}},
+    )
+    services = {"strategy_snapshot": context.strategy_snapshot}
+    registry = build_real_registry(llm=FailingLLM(), search=FakeSearchProvider())
+
+    first = await registry.get("N09").execute({
+        "N05": {"original_text": simplified, "fixed_anchors": ["万万没想到"]},
+        "N08": {"sources": []},
+    }, services)
+    second = await registry.get("N09").execute({
+        "N05": {"original_text": traditional, "fixed_anchors": ["萬萬沒想到"]},
+        "N08": {"sources": []},
+    }, services)
+    exhausted = await registry.get("N09").execute({
+        "N05": {"original_text": mixed, "fixed_anchors": ["萬万没想到"]},
+        "N08": {"sources": []},
+    }, services)
+
+    assert first["artifact"]["fallback"]["count"] == 1
+    assert second["artifact"]["fallback"]["count"] == 2
+    assert exhausted["outcome"] == "ABANDON_ORIGINAL"
+    assert context.loop_counters == {
+        "variant_search:万万没想到事情竟然会变成这样": 2,
+    }
+    assert context.exhausted_originals == [simplified]
 
 
 @pytest.mark.asyncio

@@ -43,26 +43,6 @@ def utcnow() -> datetime:
     return datetime.now(UTC)
 
 
-class _AuditEventBuffer(list[Any]):
-    """Enrich buffered completion events from their persisted node artifact."""
-
-    def __init__(self, owner: RunContext, values: list[Any]) -> None:
-        super().__init__(values)
-        self.owner = owner
-
-    def append(self, event: Any) -> None:
-        if getattr(event, "type", None) == "node.completed":
-            payload = getattr(event, "payload", None)
-            node_key = payload.get("node_key") if isinstance(payload, dict) else None
-            artifact = self.owner.active_artifacts.get(node_key, {})
-            fallback = artifact.get("fallback") if isinstance(artifact, dict) else None
-            if isinstance(payload, dict) and isinstance(fallback, dict):
-                for field_name in ("count", "threshold", "reason"):
-                    if field_name in fallback:
-                        payload[field_name] = fallback[field_name]
-        super().append(event)
-
-
 class RuntimeStrategySnapshot(dict[str, Any]):
     """Strategy data plus run-local state that must not enter persisted JSON."""
 
@@ -111,7 +91,6 @@ class RunContext:
         self.strategy_snapshot = RuntimeStrategySnapshot(
             self.strategy_snapshot, self.loop_counters, self.exhausted_originals,
         )
-        self.event_buffer = _AuditEventBuffer(self, self.event_buffer)
 
     def __setattr__(self, name: str, value: Any) -> None:
         if (name == "strategy_snapshot" and isinstance(value, dict)

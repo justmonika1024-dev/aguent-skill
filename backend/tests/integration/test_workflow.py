@@ -4,7 +4,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 
-from app.db.models import RunNodeExecution
+from app.db.models import RunEvent, RunNodeExecution
 from app.db.persistence import SQLiteRepository
 from app.main import app
 from app.workflow.context import AdmissionMode, RunContext, RunMode, RunState
@@ -84,12 +84,18 @@ def test_variant_search_limit_routes_auto_and_manual_differently(mode, expected)
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("node_key", ["N09", "N11"])
-async def test_node_completed_sse_event_includes_fallback_audit_fields(node_key):
+async def test_node_completed_event_includes_persisted_fallback_audit_fields(
+    node_key, tmp_path,
+):
     context = RunContext(
         mode=RunMode.AUTO_DISCOVERY,
         admission_mode=AdmissionMode.AUTO,
     )
-    engine = WorkflowEngine()
+    repository = SQLiteRepository(
+        f"sqlite+aiosqlite:///{tmp_path / f'{node_key}-fallback-event.db'}",
+    )
+    await repository.create_run(context)
+    engine = WorkflowEngine(repository=repository)
     engine.contexts[context.run_id] = context
     engine.buses[context.run_id] = EventBus()
     context.active_artifacts[node_key] = {
@@ -99,17 +105,33 @@ async def test_node_completed_sse_event_includes_fallback_audit_fields(node_key)
             "reason": f"{node_key}_MORE_VARIANT_EVIDENCE",
         },
     }
+    async def read_live_sse():
+        event = await anext(engine.buses[context.run_id].subscribe())
+        return event.sse()
+
+    live_sse_task = asyncio.create_task(read_live_sse())
+    await asyncio.sleep(0)
 
     await engine._emit(context, "node.completed", {
         "node_key": node_key,
         "outcome": "ABANDON_ORIGINAL",
     })
 
+    live_sse = await live_sse_task
     event = engine.events(context.run_id)[0][-1]
     assert event.payload["count"] == 2
     assert event.payload["threshold"] == 2
     assert event.payload["reason"] == f"{node_key}_MORE_VARIANT_EVIDENCE"
-    assert '"count": 2' in event.sse()
+    assert '"count": 2' in live_sse
+    async with repository.session() as session:
+        persisted = await session.scalar(select(RunEvent).where(
+            RunEvent.run_id == context.run_id,
+            RunEvent.event_type == "node.completed",
+        ))
+    assert persisted is not None
+    assert persisted.payload_json["count"] == 2
+    assert persisted.payload_json["threshold"] == 2
+    assert persisted.payload_json["reason"] == f"{node_key}_MORE_VARIANT_EVIDENCE"
 
 
 @pytest.mark.asyncio

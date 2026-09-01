@@ -337,6 +337,15 @@ class WorkflowEngine:
             self._tasks.pop(context.run_id, None)
 
     async def _emit(self, context: RunContext, event_type: str, payload: dict[str, Any]) -> None:
+        payload = dict(payload)
+        if event_type == "node.completed":
+            node_key = payload.get("node_key")
+            artifact = context.active_artifacts.get(node_key, {})
+            fallback = artifact.get("fallback") if isinstance(artifact, dict) else None
+            if isinstance(fallback, dict):
+                for field_name in ("count", "threshold", "reason"):
+                    if field_name in fallback:
+                        payload[field_name] = fallback[field_name]
         event = Event(event_type, context.run_id, context.run_version, context.current_state.value,
                       payload, context.active_branch_id)
         await self.buses[context.run_id].publish(event)

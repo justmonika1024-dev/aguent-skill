@@ -7,6 +7,7 @@ The state machine still owns all routing decisions.
 from __future__ import annotations
 
 import re
+import unicodedata
 from difflib import SequenceMatcher
 from typing import Any
 
@@ -519,6 +520,43 @@ _COMMON_TRADITIONAL_TO_SIMPLIFIED = str.maketrans({
     "傳": "传", "統": "统", "變": "变", "種": "种", "書": "书",
     "圖": "图", "簡": "简", "轉": "转", "換": "换", "純": "纯",
     "異": "异", "廣": "广", "東": "东", "臺": "台", "灣": "湾",
+    "萬": "万", "沒": "没", "風": "风", "雲": "云", "電": "电",
+    "車": "车", "馬": "马", "鳥": "鸟", "魚": "鱼", "龍": "龙",
+    "鳳": "凤", "貓": "猫", "劉": "刘", "張": "张", "楊": "杨",
+    "陳": "陈", "趙": "赵", "錢": "钱", "孫": "孙", "難": "难",
+    "歡": "欢", "歸": "归", "聽": "听", "見": "见", "給": "给",
+    "認": "认", "識": "识", "講": "讲", "請": "请", "謝": "谢",
+    "讀": "读", "買": "买", "賣": "卖", "著": "着", "麼": "么",
+    "於": "于", "將": "将", "當": "当", "麗": "丽", "嚴": "严",
+    "壞": "坏", "媽": "妈", "爺": "爷", "兒": "儿", "歲": "岁",
+    "號": "号", "遠": "远", "邊": "边", "選": "选", "擇": "择",
+    "啟": "启", "閉": "闭", "報": "报", "導": "导", "業": "业",
+    "產": "产", "線": "线", "級": "级", "數": "数", "據": "据",
+    "庫": "库", "測": "测", "試": "试", "驗": "验", "錯": "错",
+    "誤": "误", "斷": "断", "軟": "软", "項": "项", "標": "标",
+    "準": "准", "確": "确", "備": "备", "計": "计", "劃": "划",
+    "務": "务", "領": "领", "組": "组", "織": "织", "構": "构",
+    "運": "运", "維": "维", "護": "护", "該": "该", "夠": "够",
+    "處": "处", "輸": "输", "鍵": "键", "檔": "档", "檢": "检",
+    "查": "查", "複": "复", "製": "制", "刪": "删", "增": "增",
+    "減": "减", "險": "险", "權": "权", "限": "限", "態": "态",
+    "狀": "状", "敗": "败", "終": "终", "歷": "历", "記": "记",
+    "錄": "录", "資": "资", "訊": "讯", "註": "注", "冊": "册",
+    "登": "登", "陸": "陆", "戶": "户", "帳": "账",
+    "聯": "联", "繫": "系", "環": "环", "境": "境",
+    "設": "设", "置": "置", "顯": "显", "示": "示",
+    "隱": "隐", "藏": "藏", "優": "优", "先": "先", "隊": "队",
+    "列": "列", "協": "协", "議": "议", "響": "响", "載": "载",
+    "則": "则", "僅": "仅", "達": "达", "額": "额",
+    "滿": "满", "縮": "缩", "擴": "扩", "寬": "宽", "緊": "紧",
+    "鬆": "松", "細": "细", "節": "节", "內": "内",
+    "畫": "画", "顏": "颜", "聲": "声", "類": "类",
+    "別": "别", "輕": "轻", "重": "重", "強": "强", "弱": "弱",
+    "復": "复", "動": "动",
+    "暫": "暂", "停": "停", "繼": "继", "續": "续", "完": "完",
+    "畢": "毕", "順": "顺", "序": "序", "併": "并", "獨": "独",
+    "衝": "冲", "突": "突", "佔": "占", "屬": "属",
+    "獲": "获", "須": "须",
 })
 _VARIANT_WRAPPER = re.compile(
     r"(?:是什么意思|什么意思|意思是|含义|释义|赏析|解析|解读|出处|"
@@ -528,9 +566,14 @@ _VARIANT_WRAPPER = re.compile(
 )
 
 
+def _canonical_original_key(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", str(text))
+    normalized = normalized.translate(_COMMON_TRADITIONAL_TO_SIMPLIFIED)
+    return _normalize_meme_text(normalized).casefold()
+
+
 def _normalize_variant_compare(text: str) -> str:
-    normalized = text.translate(_COMMON_TRADITIONAL_TO_SIMPLIFIED)
-    normalized = normalized.replace("你说得对", "你说的对").casefold()
+    normalized = _canonical_original_key(text)
     return re.sub(r"[^0-9a-z\u4e00-\u9fff]", "", normalized)
 
 
@@ -576,7 +619,7 @@ def is_substantive_variant(
 
 
 def _normalize_duplicate_text(text: str) -> str:
-    normalized = _normalize_meme_text(text).lower().replace("小孩子", "小孩")
+    normalized = _canonical_original_key(text).replace("小孩子", "小孩")
     return re.sub(r"[^0-9a-z\u4e00-\u9fff]", "", normalized)
 
 
@@ -731,9 +774,31 @@ def _runtime_exhausted_originals(services: Any) -> list[str]:
     if not isinstance(values, list):
         return []
     return list(dict.fromkeys(
-        str(value).strip() for value in values
-        if isinstance(value, str) and value.strip()
+        _canonical_original_key(value) for value in values
+        if isinstance(value, str) and _canonical_original_key(value)
     ))
+
+
+def _filter_exhausted_sources(
+    sources: list[dict[str, Any]], exhausted_originals: list[str],
+) -> tuple[list[dict[str, Any]], int]:
+    exhausted_keys = [
+        _normalize_variant_compare(original) for original in exhausted_originals
+        if len(_normalize_variant_compare(original)) >= 6
+    ]
+    if not exhausted_keys:
+        return list(sources), 0
+    eligible: list[dict[str, Any]] = []
+    filtered_count = 0
+    for source in sources:
+        evidence = _normalize_variant_compare(
+            str(source.get("title", "")) + "\n" + str(source.get("text", "")),
+        )
+        if any(original in evidence for original in exhausted_keys):
+            filtered_count += 1
+        else:
+            eligible.append(source)
+    return eligible, filtered_count
 
 
 def _remove_exhausted_originals(
@@ -763,7 +828,8 @@ def _bounded_variant_fallback(
         services.get("strategy_snapshot") if isinstance(services, dict) else None
     )
     counters = getattr(strategy_snapshot, "loop_counters", None)
-    key = f"variant_search:{original}"
+    original_key = _canonical_original_key(original)
+    key = f"variant_search:{original_key}"
     current = int(counters.get(key, 0)) if isinstance(counters, dict) else 0
     if current >= _MAX_VARIANT_SEARCH_RETRIES:
         outcome = "ABANDON_ORIGINAL"
@@ -771,9 +837,12 @@ def _bounded_variant_fallback(
         exhausted_originals = getattr(
             strategy_snapshot, "exhausted_originals", None,
         )
-        if (isinstance(exhausted_originals, list) and original
-                and original not in exhausted_originals):
-            exhausted_originals.append(original)
+        if (isinstance(exhausted_originals, list) and original_key
+                and original_key not in {
+                    _canonical_original_key(value)
+                    for value in exhausted_originals if isinstance(value, str)
+                }):
+            exhausted_originals.append(original_key)
     else:
         count = current + 1
         if isinstance(counters, dict):
@@ -921,11 +990,31 @@ class RealWorkflowNode:
             prefix = "O" if self.key == "N04" else "V"
             for index, item in enumerate(unique.values(), 1):
                 item["source_id"] = f"{prefix}{index:03d}"
-            return {"outcome": self.outcome, "artifact": {
-                "queries": queries, "results": all_results, "failures": failures,
-                "sources": list(unique.values()),
+            sources = list(unique.values())
+            result_items = all_results
+            filtered_count = 0
+            if self.key == "N04":
+                exhausted_originals = _runtime_exhausted_originals(services)
+                sources, filtered_count = _filter_exhausted_sources(
+                    sources, exhausted_originals,
+                )
+                result_items, _ = _filter_exhausted_sources(
+                    all_results, exhausted_originals,
+                )
+            result_outcome = (
+                "HUMAN_REVIEW_REQUIRED"
+                if filtered_count and not sources else self.outcome
+            )
+            artifact = {
+                "queries": queries, "results": result_items, "failures": failures,
+                "sources": sources,
                 "request_ids": request_ids, "cost_dollars": sum(costs) if costs else None,
-            }}
+            }
+            if filtered_count:
+                artifact["filtered_exhausted_source_count"] = filtered_count
+            if result_outcome == "HUMAN_REVIEW_REQUIRED":
+                artifact["rejection_reason"] = "ONLY_EXHAUSTED_ORIGINAL_EVIDENCE"
+            return {"outcome": result_outcome, "artifact": artifact}
         if self.key == "N06" and isinstance(value, dict):
             selected = value.get("N05", {})
             selected = selected.get("llm", selected) if isinstance(selected, dict) else {}
@@ -965,6 +1054,22 @@ class RealWorkflowNode:
             }}
         if self.key not in _LLM_NODES:
             return {"outcome": self.outcome, "artifact": {"node_key": self.key, "input_node_keys": list(value) if isinstance(value, dict) else []}}
+        if self.key == "N05" and isinstance(value, dict):
+            n04 = value.get("N04", {})
+            sources = n04.get("sources", []) if isinstance(n04, dict) else []
+            eligible_sources, filtered_count = _filter_exhausted_sources(
+                sources if isinstance(sources, list) else [],
+                _runtime_exhausted_originals(services),
+            )
+            if filtered_count and not eligible_sources:
+                return {"outcome": "HUMAN_REVIEW_REQUIRED", "artifact": {
+                    "sources": [],
+                    "filtered_exhausted_source_count": filtered_count,
+                    "rejection_reason": "ONLY_EXHAUSTED_ORIGINAL_EVIDENCE",
+                }}
+            if filtered_count:
+                value = dict(value)
+                value["N04"] = {**n04, "sources": eligible_sources}
         if self.key == "N07" and isinstance(value, dict):
             selected = value.get("N05", {})
             selected = selected.get("llm", selected) if isinstance(selected, dict) else {}
