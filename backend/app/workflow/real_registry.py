@@ -39,9 +39,9 @@ _OUTCOMES = {
 _LLM_NODES = {"N01", "N02", "N03", "N05", "N07", "N09", "N10", "N11", "N11.5", "N12", "N13", "N14", "N15", "N19"}
 
 _MAX_OUTPUT_TOKENS = {
-    "N01": 1500, "N02": 4000, "N03": 1600, "N05": 1800, "N09": 2400,
-    "N10": 1800, "N11": 1200, "N11.5": 1600, "N12": 6000,
-    "N13": 4000, "N14": 1000, "N15": 1200, "N19": 1600,
+    "N01": 1500, "N02": 4000, "N03": 1600, "N05": 4000, "N09": 4000,
+    "N10": 4000, "N11": 1200, "N11.5": 1600, "N12": 6000,
+    "N13": 4000, "N14": 1000, "N15": 1200, "N19": 4000,
 }
 
 _INSTRUCTIONS = {
@@ -730,6 +730,28 @@ def _normalize_anchors(original: str, raw_anchors: Any) -> list[str]:
     return list(dict.fromkeys(anchors))[:8]
 
 
+def _directive_search_terms(directive: str) -> str:
+    terms: list[str] = []
+    for marker in ("论坛", "微博", "知乎", "评论区"):
+        if marker in directive:
+            terms.append(marker)
+    if re.search(r"(?:UGC|网友|用户发布|真实改写)", directive, re.IGNORECASE):
+        terms.append("网友改编")
+    if re.search(r"(?:槽位|替换|改写|改编|变式)", directive):
+        terms.append("槽位替换")
+    if re.search(r"(?:排除|过滤).*(?:转载|百科|释义|聚合)", directive):
+        terms.extend(["网友原创", "改编"])
+    if "双关" in directive:
+        terms.append("双关改编")
+    if "搞笑" in directive:
+        terms.append("搞笑改编")
+    if not terms:
+        positive_clause = re.split(r"[；;，,。]|并排除|排除|过滤", directive, 1)[0]
+        positive_clause = re.sub(r"\s+", " ", positive_clause).strip()
+        terms.append(positive_clause[:24] or "网友改编")
+    return " ".join(dict.fromkeys(terms))
+
+
 def _variant_search_plan(
     original: str,
     anchors: list[str],
@@ -765,12 +787,15 @@ def _variant_search_plan(
             "strategy_origin": "STRATEGY_PREFER_UGC",
         })
     for directive in directives[:2]:
+        search_terms = _directive_search_terms(directive)
         plan.append({
             "query_id": f"VQ{len(plan) + 1}",
-            "query": f'"{primary}" {directive}',
+            "query": f'"{primary}" {search_terms}',
             "search_type": "auto",
             "purpose": "执行人工反馈指令并寻找槽位替换",
             "strategy_origin": "FEEDBACK_DIRECTIVE",
+            "feedback_directive": directive,
+            "search_terms": search_terms,
         })
     fillers = [
         (f'"{primary}" 衍生梗 网友原文', "定位网友发布的实际衍生文案", "UGC_VARIANT_FALLBACK"),
@@ -789,6 +814,11 @@ def _variant_search_plan(
 def _normalize_meme_text(text: str) -> str:
     return re.sub(r"\s+", "", text.strip().replace("你说得对", "你说的对")
                   .replace("“", '"').replace("”", '"').rstrip("。！？!?"))
+
+
+def _normalize_template_match_text(text: str) -> str:
+    normalized = normalize_chinese_script(_normalize_meme_text(text))
+    return re.sub(r"[，。！？、；：,.!?;:\"'《》]", "", normalized)
 
 
 _VARIANT_WRAPPER = re.compile(
@@ -811,6 +841,17 @@ def _normalize_variant_compare(text: str) -> str:
 
 def _same_original_identity(left_key: str, right_key: str) -> bool:
     return bool(left_key) and left_key == right_key
+
+
+def _is_child_choice_structure(text: str) -> bool:
+    canonical = normalize_chinese_script(text)
+    return bool(
+        re.match(r"^小孩(?:子)?才做选择", canonical)
+        and any(
+            token in canonical
+            for token in ("全都要", "都要", "什么都没有")
+        )
+    )
 
 
 def _unique_identity_count(values: list[str]) -> int:
@@ -968,7 +1009,7 @@ async def _final_formal_duplicate_check(
 
 
 def _template_pattern(template: str) -> re.Pattern[str]:
-    parts = re.split(r"(\{[^{}]+\})", _normalize_meme_text(template))
+    parts = re.split(r"(\{[^{}]+\})", _normalize_template_match_text(template))
     pattern = "".join((".*?" if "可选" in part else ".+?")
                       if part.startswith("{") and part.endswith("}") else re.escape(part)
                       for part in parts)
@@ -976,7 +1017,7 @@ def _template_pattern(template: str) -> re.Pattern[str]:
 
 
 def _template_captures(template: str, text: str) -> dict[str, list[str]] | None:
-    parts = re.split(r"(\{[^{}]+\})", _normalize_meme_text(template))
+    parts = re.split(r"(\{[^{}]+\})", template)
     slot_names: list[str] = []
     pattern_parts: list[str] = []
     for part in parts:
@@ -984,8 +1025,8 @@ def _template_captures(template: str, text: str) -> dict[str, list[str]] | None:
             slot_names.append(part[1:-1])
             pattern_parts.append("(.*?)" if "可选" in part else "(.+?)")
         else:
-            pattern_parts.append(re.escape(part))
-    match = re.fullmatch("".join(pattern_parts), _normalize_meme_text(text))
+            pattern_parts.append(re.escape(_normalize_template_match_text(part)))
+    match = re.fullmatch("".join(pattern_parts), _normalize_template_match_text(text))
     if match is None:
         return None
     captures: dict[str, list[str]] = {}
@@ -995,21 +1036,30 @@ def _template_captures(template: str, text: str) -> dict[str, list[str]] | None:
 
 
 def _validate_template(template: str, original: str, variants: list[dict[str, Any]]) -> None:
-    slots = re.findall(r"\{[^{}]+\}", template)
-    fixed = re.sub(r"\{[^{}]+\}", "", template)
-    fixed_chars = re.sub(r"[\s，。！？、；：,.!?;:\"'《》]", "", fixed)
-    if not slots or len(fixed_chars) < 4:
-        raise ValueError("N10 template must contain reusable slots and meaningful fixed structure")
+    structure_error = _template_structure_error(template)
+    if structure_error:
+        raise ValueError(structure_error)
     pattern = _template_pattern(template)
-    if not pattern.fullmatch(_normalize_meme_text(original)):
+    if not pattern.fullmatch(_normalize_template_match_text(original)):
         raise ValueError("N10 template does not reconstruct the selected original meme")
     matched = 0
     for variant in variants:
         text = str(variant.get("variant_text", "")).split("。", 1)[0]
-        if pattern.fullmatch(_normalize_meme_text(text)):
+        if pattern.fullmatch(_normalize_template_match_text(text)):
             matched += 1
     if matched < 2:
         raise ValueError("N10 template is not supported by at least two verified variants")
+
+
+def _template_structure_error(template: str) -> str | None:
+    if not template or "agu" in template or "凿" in template:
+        return "N10 returned invalid template"
+    slots = re.findall(r"\{[^{}]+\}", template)
+    fixed = re.sub(r"\{[^{}]+\}", "", template)
+    fixed_chars = re.sub(r"[\s，。！？、；：,.!?;:\"'《》]", "", fixed)
+    if not slots or len(fixed_chars) < 4:
+        return "N10 template must contain reusable slots and meaningful fixed structure"
+    return None
 
 
 def _supported_replaceable_prefix(original: str, variants: list[dict[str, Any]]) -> str:
@@ -1041,18 +1091,30 @@ def _clean_variant_text(original: str, text: str, anchors: list[str]) -> str | N
     explanatory = re.compile(
         r"(?:是什么梗|什么意思|网络流行语|网络流行词|网梗词|意义及解释|"
         r"词意|这句话|这个梗|意思是|是一个.{0,8}梗|是指|源于|出自|出处|最初|"
-        r"用意是|说法是|年度金句|摘要|梗图产生器)",
+        r"用意是|说法是|年度金句|摘要|梗图产生器|英文是什麼|英文是什么|"
+        r"優點缺點|优点缺点|懶人包|懒人包|\[爆卦\])",
         re.IGNORECASE,
     )
     if explanatory.search(text):
         return None
+    if "你说的对，但是《" in original and "自主研发的一款" in original:
+        product_start = re.search(r"你说[的得]对，但是", text)
+        if product_start is not None:
+            text = text[product_start.start():]
+    canonical_original = normalize_chinese_script(original)
+    if _is_child_choice_structure(canonical_original):
+        canonical_text = normalize_chinese_script(text)
+        child_start = re.search(r"小(?:孩(?:子)?|朋(?:友|油))才做选择", canonical_text)
+        if child_start is not None:
+            text = text[child_start.start():]
     original_normalized = _normalize_duplicate_text(original)
     text_normalized = _normalize_duplicate_text(text)
     if not text_normalized or text_normalized == original_normalized:
         return None
     similarity = SequenceMatcher(None, original_normalized, text_normalized).ratio()
+    canonical_original = normalize_chinese_script(original)
     slot_replacement_structure = (
-        (re.match(r"^小孩(?:子)?才做选择", original) and original.endswith("我全都要"))
+        _is_child_choice_structure(canonical_original)
         or ("你说的对，但是《" in original and "自主研发的一款" in original)
     )
     if (not slot_replacement_structure
@@ -1073,14 +1135,28 @@ def _clean_variant_text(original: str, text: str, anchors: list[str]) -> str | N
 def _filter_verified_variants(
     original: str, anchors: list[str], variants: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    noise = re.compile(r"(?:^\s*#|下载|购买|Steam|中文名|分享到|关注我们|最新进展|网络梗的一种|网络流行词|作为网络语|别名|拼音)", re.IGNORECASE)
+    noise = re.compile(
+        r"(?:^\s*#|下载|购买|Steam|中文名|分享到|关注我们|最新进展|"
+        r"网络梗的一种|网络流行词|作为网络语|别名|拼音|下一句(?:是|什么)|"
+        r"第\s*\d+\s*章|目录最新章节|小说无防盗章节|全文免费阅读|"
+        r"(?:\\?_|-)\s*(?:搜狐汽车|搜狐网|腾讯云开发者社区|腾讯云))",
+        re.IGNORECASE,
+    )
     filtered: list[dict[str, Any]] = []
     per_url: dict[str, int] = {}
     seen_evidence: list[tuple[str, str]] = []
+    canonical_original = normalize_chinese_script(original)
+    bold_demon_structure = (
+        canonical_original.startswith("大胆")
+        and "我一眼就看出你不是" in canonical_original
+    )
     for variant in variants:
         text = str(variant.get("variant_text", "")).strip()
         url = str(variant.get("source_url", ""))
-        if not text or len(text) > 220 or noise.search(text) or _STOREFRONT_SOURCE.search(url):
+        placeholder_groups = re.findall(r"(?:…{2,}|\.{3,})", text)
+        if (not text or len(text) > 220 or noise.search(text)
+                or len(placeholder_groups) >= 2
+                or _STOREFRONT_SOURCE.search(url)):
             continue
         cleaned_text = _clean_variant_text(original, text, anchors)
         if cleaned_text is None:
@@ -1090,8 +1166,20 @@ def _filter_verified_variants(
             normalized = text.replace("你说得对", "你说的对")
             if "你说的对，但是" not in normalized or "自主研发的一款" not in normalized:
                 continue
-        elif re.match(r"^小孩(?:子)?才做选择", original) and original.endswith("我全都要"):
-            if not re.search(r"小孩(?:子)?才做选择", text) or not any(token in text for token in ("都要", "全都要", "什么都没有")):
+        canonical_text = normalize_chinese_script(text)
+        if _is_child_choice_structure(canonical_original):
+            if (not re.search(
+                    r"^小(?:孩(?:子)?|朋(?:友|油))才做选择(?:呢)?", canonical_text,
+                ) or not any(
+                    token in canonical_text
+                    for token in ("都要", "全都要", "什么都没有")
+                )):
+                continue
+        elif bold_demon_structure:
+            normalized_shape = _normalize_template_match_text(canonical_text)
+            if re.fullmatch(
+                r"大胆.+?我一眼就看出你不是.+", normalized_shape,
+            ) is None:
                 continue
         elif original == "我真的会谢":
             if not re.search(r"我真的会谢[！!。.]?$", text) or len(text) > 80:
@@ -1116,6 +1204,14 @@ def _filter_verified_variants(
 
 
 _MAX_VARIANT_SEARCH_RETRIES = 2
+_AUTO_DISCOVERY_FALLBACK_AFTER = 2
+_MAX_AUTO_DISCOVERY_ABANDONS = 5
+_AUTO_DISCOVERY_FALLBACKS = [
+    "小孩子才做选择，我全都要",
+    "大胆妖孽，我一眼就看出你不是人",
+    "抛开事实不谈，难道你就没有错吗",
+    "我走过最长的路，就是你的套路",
+]
 
 
 def _runtime_exhausted_originals(services: Any) -> list[str]:
@@ -1213,6 +1309,36 @@ def _remove_exhausted_originals(
                     for original in excluded
                 )
             ]
+
+
+def _available_auto_discovery_fallback(
+    exhausted_originals: list[str], formal_titles: list[dict[str, Any]],
+) -> str | None:
+    exhausted_keys = [
+        _canonical_original_key(original) for original in exhausted_originals
+        if _canonical_original_key(original)
+    ]
+    title_texts = [
+        str(item.get("title", "")) for item in formal_titles
+        if isinstance(item, dict) and str(item.get("title", "")).strip()
+    ]
+    for fallback in _AUTO_DISCOVERY_FALLBACKS:
+        fallback_key = _canonical_original_key(fallback)
+        if any(
+            _same_original_identity(fallback_key, exhausted_key)
+            for exhausted_key in exhausted_keys
+        ):
+            continue
+        if any(
+            fallback_key in _canonical_original_key(title)
+            or _canonical_original_key(title) in fallback_key
+            or _duplicate_similarity(fallback, title) >= 0.72
+            for title in title_texts
+            if _canonical_original_key(title)
+        ):
+            continue
+        return fallback
+    return None
 
 
 def _bounded_variant_fallback(
@@ -1395,6 +1521,8 @@ class RealWorkflowNode:
         outcome = self.outcome
         parsed: dict[str, Any]
         applied_evaluation_directives: list[str] = []
+        prevalidation_issue: str | None = None
+        correction_attempts = 0
         n13_thresholds = {"fluency": 6, "recognition": 6, "agu_fit": 6}
         if self.key in {"N04", "N08"}:
             if self.search is None:
@@ -1573,11 +1701,21 @@ class RealWorkflowNode:
             parsed = {"queries": _variant_search_plan(
                 original, anchors, search_strategy, directives,
             )}
+            directive_query_mappings = [
+                {
+                    "directive": str(query.get("feedback_directive", "")),
+                    "query_id": str(query.get("query_id", "")),
+                    "search_terms": str(query.get("search_terms", "")),
+                }
+                for query in parsed["queries"]
+                if query.get("strategy_origin") == "FEEDBACK_DIRECTIVE"
+                and query.get("feedback_directive")
+            ]
             applied_directives = [
                 directive for directive in directives
                 if any(
                     query.get("strategy_origin") == "FEEDBACK_DIRECTIVE"
-                    and directive in str(query.get("query", ""))
+                    and query.get("feedback_directive") == directive
                     for query in parsed["queries"]
                 )
             ]
@@ -1585,6 +1723,7 @@ class RealWorkflowNode:
                 "llm": parsed,
                 "planning_mode": "STRATEGY_GUIDED",
                 "applied_directives": applied_directives,
+                "directive_query_mappings": directive_query_mappings,
                 "strategy_version_id": services.get("strategy_version_id")
                 if isinstance(services, dict) else None,
             }}
@@ -1598,6 +1737,7 @@ class RealWorkflowNode:
             if "你说的对，但是《" in original and "自主研发的一款" in original:
                 template = "你说的对，但是《{主题}》是由{研发方}自主研发的一款{后续描述}。"
                 _validate_template(template, original, variants)
+                template_pattern = _template_pattern(template)
                 parsed = {
                     "canonical_template_text": template,
                     "fixed_segments": ["你说的对，但是《", "》是由", "自主研发的一款", "。"],
@@ -1606,21 +1746,94 @@ class RealWorkflowNode:
                         {"name": "研发方", "semantic_role": "研发主体"},
                         {"name": "后续描述", "semantic_role": "与主题匹配的短描述"},
                     ],
-                    "evidence_variant_texts": [v.get("variant_text", "") for v in variants[:6]],
+                    "evidence_variant_texts": [
+                        text for variant in variants
+                        if (text := str(variant.get("variant_text", "")))
+                        and template_pattern.fullmatch(
+                            _normalize_template_match_text(text),
+                        )
+                    ][:6],
                     "template_explanation": "原句和变式共同保留介绍体骨架，替换主题、研发方和短描述。",
                 }
                 return {"outcome": self.outcome, "artifact": {"llm": parsed, "extraction_mode": "VALIDATED_KNOWN_STRUCTURE"}}
-            if re.match(r"^小孩(?:子)?才做选择", original) and original.endswith("我全都要"):
-                template = "{年幼者}才做选择，{主体}{全都要表达}"
+            canonical_original = normalize_chinese_script(original)
+            if _is_child_choice_structure(canonical_original):
+                choice_match = re.match(
+                    r"^(小孩(?:子)?)才做选择([^，,]*)[，,]",
+                    canonical_original,
+                )
+                original_child_label = choice_match.group(1) if choice_match else "小孩子"
+                choice_suffix = choice_match.group(2) if choice_match else ""
+                variant_child_labels = [
+                    match.group(1)
+                    for variant in variants
+                    if (match := re.search(
+                        r"(小孩(?:子)?|小朋友)才做选择",
+                        _normalize_template_match_text(
+                            str(variant.get("variant_text", "")),
+                        ),
+                    ))
+                ]
+                has_child_label_replacement = any(
+                    label != original_child_label for label in variant_child_labels
+                )
+                original_tail = _normalize_template_match_text(
+                    canonical_original,
+                ).split("才做选择", 1)[1]
+                has_tail_replacement = any(
+                    "才做选择" in (canonical_variant := _normalize_template_match_text(
+                        str(variant.get("variant_text", "")),
+                    ))
+                    and canonical_variant.split("才做选择", 1)[1] != original_tail
+                    for variant in variants
+                )
+                if not has_child_label_replacement and (
+                    choice_suffix or has_tail_replacement
+                ):
+                    template = f"{original_child_label}才做选择{{变化内容}}"
+                elif choice_suffix:
+                    template = "{年幼者}才做选择{变化内容}"
+                else:
+                    template = (
+                        "{年幼者}才做选择，{主体}{全都要表达}"
+                        if has_tail_replacement
+                        else "{年幼者}才做选择，我全都要"
+                    )
                 _validate_template(template, original, variants)
-                parsed = {
-                    "canonical_template_text": template,
-                    "fixed_segments": ["才做选择", "，"],
-                    "slots": [
+                if not has_child_label_replacement and (
+                    choice_suffix or has_tail_replacement
+                ):
+                    fixed_segments = [f"{original_child_label}才做选择"]
+                    slots = [{
+                        "name": "变化内容",
+                        "semantic_role": "选择后的后缀、主体与全都要或反转表达",
+                    }]
+                elif choice_suffix:
+                    fixed_segments = ["才做选择"]
+                    slots = [
+                        {"name": "年幼者", "semantic_role": "小孩或小孩子"},
+                        {
+                            "name": "变化内容",
+                            "semantic_role": "选择后的后缀、主体与全都要或反转表达",
+                        },
+                    ]
+                elif has_tail_replacement:
+                    fixed_segments = ["才做选择", "，"]
+                    slots = [
                         {"name": "年幼者", "semantic_role": "小孩或小孩子"},
                         {"name": "主体", "semantic_role": "说话者或与小孩子对照的主体"},
                         {"name": "全都要表达", "semantic_role": "全都要或近义反转表达"},
-                    ],
+                    ]
+                else:
+                    fixed_segments = ["才做选择", "我全都要"]
+                    slots = [{
+                        "name": "年幼者",
+                        "semantic_role": "被替换的小孩、小孩子或小朋友称呼",
+                    }]
+                parsed = {
+                    "canonical_template_text": template,
+                    "fixed_segments": fixed_segments,
+                    "slots": slots,
                     "evidence_variant_texts": [v.get("variant_text", "") for v in variants[:6]],
                     "template_explanation": "变式共同保留年幼者才做选择与后半句全要/反转的对照节奏。",
                 }
@@ -1735,15 +1948,27 @@ class RealWorkflowNode:
             original_key = _canonical_original_key(str(original))
             pattern = _template_pattern(template)
             original_reconstructable = (
-                pattern.fullmatch(_normalize_meme_text(str(original))) is not None
+                pattern.fullmatch(
+                    _normalize_template_match_text(str(original)),
+                ) is not None
             )
+            unique_variants: dict[str, dict[str, Any]] = {}
+            for variant in variants:
+                if not isinstance(variant, dict):
+                    continue
+                identity = _canonical_original_key(
+                    str(variant.get("variant_text", "")),
+                )
+                if identity:
+                    unique_variants.setdefault(identity, variant)
+            coverage_variants = list(unique_variants.values())
             matched = sum(
-                pattern.fullmatch(_normalize_meme_text(
+                pattern.fullmatch(_normalize_template_match_text(
                     str(variant.get("variant_text", "")).split("。", 1)[0],
                 )) is not None
-                for variant in variants if isinstance(variant, dict)
+                for variant in coverage_variants
             )
-            total = sum(isinstance(variant, dict) for variant in variants)
+            total = len(coverage_variants)
             coverage = matched / total if total else 0.0
             fixed_segments = template_node.get("fixed_segments", [])
             fixed_segments = [
@@ -1767,7 +1992,7 @@ class RealWorkflowNode:
             verified_evidence = [
                 text for text in evidence_variant_texts
                 if _canonical_original_key(text) in variant_keys
-                and pattern.fullmatch(_normalize_meme_text(text))
+                and pattern.fullmatch(_normalize_template_match_text(text))
             ]
             original_captures = _template_captures(template, str(original)) or {}
             evidence_captures = [
@@ -1807,7 +2032,14 @@ class RealWorkflowNode:
             if not unique_slots:
                 problems.append("模板缺少可复用槽位或有意义的固定结构")
             fixed_ratio = len(fixed_key) / max(1, len(original_key))
-            if len(fixed_key) < 5 or fixed_ratio < 0.4:
+            child_choice_templates = {
+                "{年幼者}才做选择，{主体}{全都要表达}",
+                "{年幼者}才做选择{变化内容}",
+            }
+            minimum_fixed_length = 4 if template in child_choice_templates else 5
+            minimum_fixed_ratio = 0.2 if template in child_choice_templates else 0.4
+            if (len(fixed_key) < minimum_fixed_length
+                    or fixed_ratio < minimum_fixed_ratio):
                 problems.append("模板固定结构过宽，不能用少量固定字配合通配槽吞入任意文本")
             declared_fixed_key = _canonical_original_key("".join(fixed_segments))
             if not fixed_segments or declared_fixed_key != fixed_key:
@@ -1863,12 +2095,12 @@ class RealWorkflowNode:
                 "llm": parsed,
                 "validation_mode": "DETERMINISTIC_COVERAGE",
             }
-            if decision == "MORE_EVIDENCE":
+            if decision in {"MORE_EVIDENCE", "REEXTRACT"}:
                 outcome, fallback = _bounded_variant_fallback(
                     services,
                     str(original),
-                    retry_outcome="MORE_EVIDENCE",
-                    reason="N11_MORE_EVIDENCE",
+                    retry_outcome=decision,
+                    reason=f"N11_{decision}",
                 )
                 artifact["fallback"] = fallback
                 return {"outcome": outcome, "artifact": artifact}
@@ -1916,7 +2148,10 @@ class RealWorkflowNode:
                 return {"outcome": "STRUCTURE_PRESERVING_REWRITE", "artifact": {
                     "llm": parsed, "routing_mode": "VALIDATED_KNOWN_STRUCTURE",
                 }}
-            if template_node.get("canonical_template_text") == "{年幼者}才做选择，{主体}{全都要表达}":
+            if template_node.get("canonical_template_text") in {
+                "{年幼者}才做选择，{主体}{全都要表达}",
+                "{年幼者}才做选择{选择后缀（可选）}，{主体}{全都要表达}",
+            }:
                 parsed = {
                     "route": "STRUCTURE_PRESERVING_REWRITE",
                     "must_preserve": ["才做选择", "全都要"],
@@ -2001,6 +2236,47 @@ class RealWorkflowNode:
                 title, str(selected["text"]),
             )
             return {"outcome": self.outcome, "artifact": {"llm": parsed, "packaging_mode": "DETERMINISTIC_FROM_N14"}}
+        if self.key == "N02":
+            exhausted_originals = _runtime_exhausted_originals(services)
+            abandoned_count = len(exhausted_originals)
+            if abandoned_count >= _MAX_AUTO_DISCOVERY_ABANDONS:
+                return {
+                    "outcome": "HUMAN_REVIEW_REQUIRED",
+                    "artifact": {
+                        "rejection_reason": "AUTO_DISCOVERY_BUDGET_EXHAUSTED",
+                        "abandoned_original_count": abandoned_count,
+                        "maximum_abandoned_originals": _MAX_AUTO_DISCOVERY_ABANDONS,
+                        "excluded_originals": exhausted_originals,
+                        "retry_suggestion": (
+                            "请人工提供新的原始梗种子，或检查失败记录后再重新启动。"
+                        ),
+                    },
+                }
+            if abandoned_count >= _AUTO_DISCOVERY_FALLBACK_AFTER:
+                formal_titles = []
+                if self.repository and hasattr(
+                    self.repository, "list_formal_meme_titles",
+                ):
+                    formal_titles = await self.repository.list_formal_meme_titles()
+                fallback = _available_auto_discovery_fallback(
+                    exhausted_originals, formal_titles,
+                )
+                if fallback:
+                    return {
+                        "outcome": self.outcome,
+                        "artifact": {
+                            "llm": {
+                                "discovery_hypothesis": (
+                                    "连续自主发现失败后，使用已验证可检索多个真实变式的基础候选。"
+                                ),
+                                "keywords": [fallback, "网友改编", "变式"],
+                                "known_example_phrases": [fallback],
+                            },
+                            "discovery_mode": "BOOTSTRAP_FALLBACK",
+                            "abandoned_original_count": abandoned_count,
+                            "excluded_originals": exhausted_originals,
+                        },
+                    }
         if self.llm is None:
             raise RuntimeError("llm provider is not configured")
         compact = _compact_artifacts(self.key, value) if isinstance(value, dict) else {"value": value}
@@ -2247,6 +2523,27 @@ class RealWorkflowNode:
                     parsed["queries"] = _specific_search_plan(phrases[0])
             elif self.key == "N05":
                 sources = value.get("N04", {}).get("sources", []) if isinstance(value, dict) else []
+                start = value.get("START", {}) if isinstance(value, dict) else {}
+                seed = str(start.get("seed_text", "")) if isinstance(start, dict) else ""
+                if seed and start.get("mode") == "MANUAL_SEED":
+                    exact_seed_source = next((
+                        item for item in sources
+                        if seed in (
+                            str(item.get("title", ""))
+                            + "\n"
+                            + str(item.get("text", ""))
+                        )
+                    ), None)
+                    if exact_seed_source is not None:
+                        parsed.update({
+                            "title": str(exact_seed_source.get("title", ""))
+                            or seed[:30],
+                            "original_text": seed,
+                            "fixed_anchors": _normalize_anchors(seed, []),
+                            "source_id": exact_seed_source.get("source_id"),
+                            "source_url": exact_seed_source.get("url", ""),
+                            "evidence_quote": seed,
+                        })
                 source = next((s for s in sources if s.get("source_id") == parsed.get("source_id")), None)
                 quote = parsed.get("evidence_quote") or parsed.get("original_text", "")
                 if source is None or quote not in ((source.get("title", "") + "\n" + source.get("text", "")) if source else ""):
@@ -2263,6 +2560,34 @@ class RealWorkflowNode:
                         if fallback:
                             source, quote = fallback
                     if not source or not quote:
+                        start = value.get("START", {}) if isinstance(value, dict) else {}
+                        mode = start.get("mode") if isinstance(start, dict) else None
+                        if mode == "AUTO_DISCOVERY":
+                            rejected_original = str(
+                                parsed.get("original_text", ""),
+                            )
+                            rejected_key = _canonical_original_key(
+                                rejected_original,
+                            )
+                            strategy_snapshot = (
+                                services.get("strategy_snapshot")
+                                if isinstance(services, dict) else None
+                            )
+                            exhausted = getattr(
+                                strategy_snapshot, "exhausted_originals", None,
+                            )
+                            if (isinstance(exhausted, list) and rejected_key
+                                    and rejected_key not in exhausted):
+                                exhausted.append(rejected_key)
+                            return {
+                                "outcome": "ABANDON_ORIGINAL",
+                                "artifact": {
+                                    "rejected_original": rejected_original,
+                                    "rejection_reason": (
+                                        "NO_VERIFIABLE_ORIGINAL_EVIDENCE"
+                                    ),
+                                },
+                            }
                         raise ValueError("N05 selection is not backed by Exa evidence")
                     parsed.update({"source_id": source.get("source_id"), "original_text": quote,
                                    "evidence_quote": quote, "title": source.get("title", quote[:30]),
@@ -2392,17 +2717,71 @@ class RealWorkflowNode:
                         {"name": "后续描述", "semantic_role": "与主题匹配的短描述"},
                     ]
                     template = parsed["canonical_template_text"]
-                if not template or "agu" in template or "凿" in template:
-                    raise ValueError("N10 returned invalid template")
-                if original.count("。") <= 1 and "。" in template:
-                    if "你说的对，但是《" not in original:
-                        parsed["canonical_template_text"] = template.split("。", 1)[0] + "。"
-                    allowed = set(re.findall(r"\{([^{}]+)\}", parsed["canonical_template_text"]))
-                    parsed["slots"] = [slot for slot in parsed.get("slots", []) if isinstance(slot, dict) and slot.get("name") in allowed]
                 variants_node = value.get("N09", {}) if isinstance(value, dict) else {}
                 variants_node = variants_node.get("llm", variants_node) if isinstance(variants_node, dict) else {}
-                _validate_template(parsed["canonical_template_text"], original,
-                                   variants_node.get("variants", []) if isinstance(variants_node, dict) else [])
+                first_structure_error: str | None = None
+                for attempt in range(3):
+                    template = str(parsed.get("canonical_template_text", ""))
+                    if original.count("。") <= 1 and "。" in template:
+                        if "你说的对，但是《" not in original:
+                            parsed["canonical_template_text"] = template.split("。", 1)[0] + "。"
+                        allowed = set(re.findall(r"\{([^{}]+)\}", parsed["canonical_template_text"]))
+                        parsed["slots"] = [
+                            slot for slot in parsed.get("slots", [])
+                            if isinstance(slot, dict) and slot.get("name") in allowed
+                        ]
+                    structure_error = _template_structure_error(
+                        str(parsed.get("canonical_template_text", "")),
+                    )
+                    if not structure_error:
+                        break
+                    if first_structure_error is None:
+                        first_structure_error = structure_error
+                    if attempt == 2:
+                        raise ValueError(first_structure_error)
+                    correction = NodeLLMRequest(
+                        node_key="N10",
+                        system_prompt=request.system_prompt + (
+                            " 上一次模板缺少可复用固定结构。请重新提取：模板必须含语义槽位，"
+                            "固定文本至少4个汉字，并且不得含agu或凿。只返回完整JSON对象。"
+                        ),
+                        user_payload={
+                            **payload,
+                            "invalid_previous_output": parsed,
+                            "validation_error": structure_error,
+                        },
+                        output_schema=request.output_schema,
+                        schema_name=request.schema_name,
+                        parameter_profile=request.parameter_profile,
+                    )
+                    retry_result = await self.llm.generate(correction)
+                    if self.repository:
+                        await self.repository.record_api_call(
+                            run_id, api_type="llm", provider=retry_result.provider,
+                            model=retry_result.model,
+                            provider_request_id=retry_result.provider_request_id,
+                            input_tokens=retry_result.input_tokens,
+                            output_tokens=retry_result.output_tokens,
+                            total_tokens=retry_result.total_tokens,
+                            latency_ms=retry_result.latency_ms, node_key=self.key,
+                        )
+                    result = retry_result
+                    parsed = retry_result.parsed_json
+                    correction_attempts += 1
+                try:
+                    _validate_template(
+                        parsed["canonical_template_text"],
+                        original,
+                        variants_node.get("variants", [])
+                        if isinstance(variants_node, dict) else [],
+                    )
+                except ValueError as exc:
+                    if str(exc) not in {
+                        "N10 template does not reconstruct the selected original meme",
+                        "N10 template is not supported by at least two verified variants",
+                    }:
+                        raise
+                    prevalidation_issue = str(exc)
             elif self.key == "N11":
                 decision = parsed.get("decision", "REEXTRACT")
                 template_node = value.get("N10", {}) if isinstance(value, dict) else {}
@@ -2499,8 +2878,10 @@ class RealWorkflowNode:
                     text = candidate_texts.get(candidate_id, "")
                     raw_problems = score.get("problems", [])
                     problems = (
-                        [raw_problems] if isinstance(raw_problems, str)
-                        else [str(problem) for problem in raw_problems]
+                        [raw_problems.strip()] if isinstance(raw_problems, str)
+                        and raw_problems.strip()
+                        else [str(problem).strip() for problem in raw_problems
+                              if str(problem).strip()]
                         if isinstance(raw_problems, list) else []
                     )
                     if reject_awkward and _AWKWARD_DEMONSTRATIVE_ACTION.search(text):
@@ -2528,11 +2909,15 @@ class RealWorkflowNode:
                         score["agu_fit"] = min(agu_fit, agu_fit_cap)
                         problems.append("动宾关系不成立：候选中存在凿其他动作受事")
                     score["problems"] = list(dict.fromkeys(problems))
-                    score["qualified"] = bool(score.get("qualified")) and all(
-                        isinstance(score.get(field), (int, float))
-                        and not isinstance(score.get(field), bool)
-                        and score[field] >= threshold
-                        for field, threshold in thresholds.items()
+                    score["qualified"] = (
+                        bool(score.get("qualified"))
+                        and not score["problems"]
+                        and all(
+                            isinstance(score.get(field), (int, float))
+                            and not isinstance(score.get(field), bool)
+                            and score[field] >= threshold
+                            for field, threshold in thresholds.items()
+                        )
                     )
                     if score["qualified"] and candidate_id in candidate_texts:
                         qualified_ids.append(candidate_id)
@@ -2606,6 +2991,10 @@ class RealWorkflowNode:
             )
             if extraction_mode:
                 artifact["extraction_mode"] = extraction_mode
+            if prevalidation_issue:
+                artifact["prevalidation_issue"] = prevalidation_issue
+            if self.key == "N10":
+                artifact["correction_attempts"] = correction_attempts
             if self.key == "N13":
                 artifact["applied_evaluation_directives"] = applied_evaluation_directives
                 artifact["minimum_thresholds"] = dict(n13_thresholds)

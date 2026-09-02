@@ -1,4 +1,6 @@
 import asyncio
+import importlib
+from uuid import uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -294,6 +296,127 @@ async def test_next_round_strategy_is_applied_before_second_n07(tmp_path):
     await engine.command(context.run_id, Command(
         "TERMINATE", expected_run_version=context.run_version,
     ))
+
+
+@pytest.mark.asyncio
+async def test_two_round_history_exposes_feedback_strategy_consumed_by_second_n07(
+    tmp_path, monkeypatch,
+):
+    outcomes = {
+        "N01": "ACCEPTED", "N02": "PLANNED", "N03": "PLAN_READY",
+        "N04": "RESULTS_FOUND", "N05": "SELECTED", "N06": "NOT_DUPLICATE",
+        "N07": "PLAN_READY", "N08": "RESULTS_FOUND", "N09": "SUFFICIENT",
+        "N10": "TEMPLATE_READY", "N11": "PASS",
+        "N11.5": "DIRECT_SLOT_FILL", "N12": "VALID_BATCH",
+        "N13": "HAS_QUALIFIED", "N14": "SELECTED", "N15": "DRAFT_READY",
+        "N16": "NOT_DUPLICATE", "N17": "WAIT_HUMAN_DECISION",
+        "N19": "PATCH_VALID", "N20": "COMPLETED",
+    }
+    nodes = {key: FakeNode(key, outcome) for key, outcome in outcomes.items()}
+    nodes["N07"] = StrategyAwareN07("N07", "PLAN_READY")
+    nodes["N19"] = FeedbackN19("N19", "PATCH_VALID")
+    repository = SQLiteRepository(f"sqlite+aiosqlite:///{tmp_path / 'two-round-api.db'}")
+    engine = WorkflowEngine(NodeRegistry(nodes), repository=repository)
+    api_router = importlib.import_module("app.api.router")
+    monkeypatch.setattr(api_router, "_engine", engine)
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test",
+    ) as client:
+        created = await client.post("/api/v1/runs", json={
+            "mode": "AUTO_DISCOVERY",
+            "admission_mode": "AUTO",
+            "continuous_enabled": True,
+        })
+        assert created.status_code == 201
+        run_id = created.json()["run_id"]
+        initial_strategy_id = created.json()["strategy_version_id"]
+
+        for _ in range(500):
+            first_snapshot = (await client.get(f"/api/v1/runs/{run_id}")).json()
+            if first_snapshot["state"] == "WAITING_HUMAN_EVALUATION":
+                break
+            await asyncio.sleep(0.002)
+        assert first_snapshot["state"] == "WAITING_HUMAN_EVALUATION"
+
+        first_evaluation = complete_evaluation_payload(
+            first_snapshot["run_version"], first_snapshot["active_branch_id"],
+        )
+        first_evaluation["variant_search_results"] = {
+            "relevance": 3,
+            "real_variant_ratio": 1,
+            "independent_evidence_quality": 2,
+            "variant_diversity": 2,
+            "comment": "结果大多是原句转载，缺少网友槽位改编",
+        }
+        first_evaluation["main_problem_nodes"] = ["N07", "N09"]
+        first_evaluation["admission"] = {
+            "override": "OVERRIDE_TO_NOT_ADMIT",
+            "reason": "第一轮变式不足",
+        }
+        first_evaluation["overall_comment"] = "第一轮低变式评分"
+        submitted = await client.post(
+            f"/api/v1/runs/{run_id}/evaluation", json=first_evaluation,
+        )
+        assert submitted.status_code == 200
+
+        for _ in range(500):
+            second_snapshot = (await client.get(f"/api/v1/runs/{run_id}")).json()
+            if (second_snapshot["state"] == "WAITING_HUMAN_EVALUATION"
+                    and second_snapshot["strategy_version_id"] != initial_strategy_id):
+                break
+            await asyncio.sleep(0.002)
+        assert second_snapshot["state"] == "WAITING_HUMAN_EVALUATION"
+        second_round_strategy_id = second_snapshot["strategy_version_id"]
+        assert second_round_strategy_id != initial_strategy_id
+
+        disabled = await client.post(f"/api/v1/runs/{run_id}/commands", json={
+            "command_id": str(uuid4()),
+            "type": "SET_CONTINUOUS_EXECUTION",
+            "expected_run_version": second_snapshot["run_version"],
+            "payload": {"enabled": False},
+        })
+        assert disabled.status_code == 200
+        second_snapshot = (await client.get(f"/api/v1/runs/{run_id}")).json()
+        assert second_snapshot["continuous_enabled"] is False
+
+        second_evaluation = complete_evaluation_payload(
+            second_snapshot["run_version"], second_snapshot["active_branch_id"],
+        )
+        second_evaluation["admission"] = {
+            "override": "OVERRIDE_TO_NOT_ADMIT",
+            "reason": "两轮自动化验收不正式入库",
+        }
+        second_evaluation["overall_comment"] = "第二轮完整评价"
+        submitted = await client.post(
+            f"/api/v1/runs/{run_id}/evaluation", json=second_evaluation,
+        )
+        assert submitted.status_code == 200
+
+        for _ in range(500):
+            record = (await client.get(f"/api/v1/runs/{run_id}/record")).json()
+            if record["run"]["state"] == "COMPLETED" and len(record["evaluations"]) == 2:
+                break
+            await asyncio.sleep(0.002)
+        strategies = (await client.get("/api/v1/strategies")).json()
+
+    assert record["run"]["state"] == "COMPLETED"
+    assert [item["overall_comment"] for item in record["evaluations"]] == [
+        "第一轮低变式评分", "第二轮完整评价",
+    ]
+    assert record["evaluations"][0]["variant_search_results"]["real_variant_ratio"] == 1
+    assert [item["version_number"] for item in strategies] == [1, 2, 3]
+    assert strategies[1]["parent_version_id"] == initial_strategy_id
+    assert strategies[1]["source_evaluation_id"] == record["evaluations"][0]["evaluation_id"]
+
+    n07_executions = [node for node in record["nodes"] if node["node_key"] == "N07"]
+    assert len(n07_executions) == 2
+    assert n07_executions[1]["strategy_version_id"] == second_round_strategy_id
+    assert n07_executions[1]["output"]["applied_directives"] == [
+        "排除原句转载，优先搜索网友槽位改编",
+    ]
+    assert len([node for node in record["nodes"] if node["node_key"] == "N19"]) == 2
+    await repository.engine.dispose()
 
 
 @pytest.mark.asyncio

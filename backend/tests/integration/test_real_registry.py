@@ -578,6 +578,151 @@ async def test_n02_allocates_enough_output_budget_for_reasoning_model_json():
 
     assert llm.requests[0].parameter_profile.max_output_tokens >= 4000
 
+
+@pytest.mark.asyncio
+async def test_n19_allocates_enough_output_budget_for_strategy_patch_json():
+    llm = FakeLLMProvider(responses=[{
+        "feedback_summary": "需要提高变式搜索质量",
+        "affected_nodes": ["N07", "N09"],
+        "patch_operations": [],
+        "score_gaps": {},
+        "next_round_hypotheses": ["提高独立来源比例"],
+    }])
+    registry = build_real_registry(llm=llm, search=FakeSearchProvider())
+
+    await registry.get("N19").execute({"N18": {}}, None)
+
+    assert llm.requests[0].parameter_profile.max_output_tokens >= 4000
+
+
+@pytest.mark.asyncio
+async def test_n02_uses_proven_searchable_fallback_after_two_exhausted_originals():
+    class ExistingFallbackRepository(EmptyFormalMemeRepositoryStub):
+        async def list_formal_meme_titles(self):
+            return [{
+                "id": "existing-fallback",
+                "title": "小孩子才做选择，我全都要",
+            }]
+
+    context = RunContext(
+        mode=RunMode.AUTO_DISCOVERY,
+        admission_mode=AdmissionMode.AUTO,
+        strategy_snapshot={"search": {}},
+        exhausted_originals=["冷门原梗一", "冷门原梗二"],
+    )
+    llm = FakeLLMProvider(responses=[{
+        "known_example_phrases": ["模型本轮提出的普通候选"],
+    }])
+    registry = build_real_registry(
+        llm=llm,
+        search=FakeSearchProvider(),
+        repository=ExistingFallbackRepository(),
+    )
+
+    result = await registry.get("N02").execute(
+        {"START": {"mode": "AUTO_DISCOVERY"}},
+        {"strategy_snapshot": context.strategy_snapshot},
+    )
+
+    assert result["outcome"] == "PLANNED"
+    assert result["artifact"]["llm"]["known_example_phrases"] == [
+        "大胆妖孽，我一眼就看出你不是人",
+    ]
+    assert result["artifact"]["discovery_mode"] == "BOOTSTRAP_FALLBACK"
+    assert result["artifact"]["abandoned_original_count"] == 2
+    assert llm.requests == []
+
+
+@pytest.mark.asyncio
+async def test_n02_stops_after_five_exhausted_originals_without_another_llm_call():
+    context = RunContext(
+        mode=RunMode.AUTO_DISCOVERY,
+        admission_mode=AdmissionMode.AUTO,
+        strategy_snapshot={"search": {}},
+        exhausted_originals=[f"连续失败原梗{i}" for i in range(5)],
+    )
+    llm = FakeLLMProvider(responses=[{
+        "known_example_phrases": ["不应再请求模型生成的候选"],
+    }])
+    registry = build_real_registry(llm=llm, search=FakeSearchProvider())
+
+    result = await registry.get("N02").execute(
+        {"START": {"mode": "AUTO_DISCOVERY"}},
+        {"strategy_snapshot": context.strategy_snapshot},
+    )
+
+    assert result["outcome"] == "HUMAN_REVIEW_REQUIRED"
+    assert result["artifact"]["rejection_reason"] == (
+        "AUTO_DISCOVERY_BUDGET_EXHAUSTED"
+    )
+    assert result["artifact"]["abandoned_original_count"] == 5
+    assert llm.requests == []
+    assert TransitionTable().next(
+        "N02", result["outcome"], mode=RunMode.AUTO_DISCOVERY.value,
+    ) == "WAITING_HUMAN_INTERVENTION"
+
+
+@pytest.mark.asyncio
+async def test_evidence_nodes_allocate_enough_output_budget_for_reasoning_json():
+    original = "大胆妖孽，我一眼就看出你不是人"
+    source = {
+        "source_id": "O001",
+        "url": "https://example.com/original",
+        "title": "经典台词",
+        "text": original,
+    }
+    n05_llm = FakeLLMProvider(responses=[{
+        "title": "经典台词",
+        "original_text": original,
+        "fixed_anchors": ["大胆", "我一眼就看出"],
+        "source_id": "O001",
+        "source_url": source["url"],
+        "evidence_quote": original,
+    }])
+    n05_registry = build_real_registry(
+        llm=n05_llm, search=FakeSearchProvider(),
+    )
+    await n05_registry.get("N05").execute({
+        "N04": {"sources": [source]},
+    }, None)
+
+    n09_llm = FakeLLMProvider(responses=[{"variants": []}])
+    n09_registry = build_real_registry(
+        llm=n09_llm, search=FakeSearchProvider(),
+    )
+    await n09_registry.get("N09").execute({
+        "N05": {
+            "original_text": "我猜中了开头，却猜不中这结局",
+            "fixed_anchors": ["我猜中了", "却猜不中"],
+        },
+        "N08": {"sources": []},
+    }, None)
+
+    n10_llm = FakeLLMProvider(responses=[{
+        "canonical_template_text": "大胆{对象}，我一眼就看出你不是{身份}",
+        "fixed_segments": ["大胆", "，我一眼就看出你不是"],
+        "slots": [{"name": "对象"}, {"name": "身份"}],
+        "evidence_variant_texts": [
+            "大胆猫猫，我一眼就看出你不是人",
+            "大胆程序员，我一眼就看出你不是产品经理",
+        ],
+    }])
+    n10_registry = build_real_registry(
+        llm=n10_llm, search=FakeSearchProvider(),
+    )
+    await n10_registry.get("N10").execute({
+        "N05": {"original_text": "大胆妖孽，我一眼就看出你不是人"},
+        "N09": {"variants": [
+            {"variant_text": "大胆猫猫，我一眼就看出你不是人"},
+            {"variant_text": "大胆程序员，我一眼就看出你不是产品经理"},
+        ]},
+    }, None)
+
+    assert n05_llm.requests[0].parameter_profile.max_output_tokens >= 4000
+    assert n09_llm.requests[0].parameter_profile.max_output_tokens >= 4000
+    assert n10_llm.requests[0].parameter_profile.max_output_tokens >= 4000
+
+
 @pytest.mark.asyncio
 async def test_real_registry_enforces_candidate_and_draft_contracts():
     texts = [
@@ -921,6 +1066,87 @@ async def test_n05_extracts_core_catchphrase_from_long_evidence_quote():
         "我信你个鬼，你个糟老头子坏得很，算得真准"
     )
     assert result["artifact"]["llm"]["evidence_quote"] == quote
+
+
+@pytest.mark.asyncio
+async def test_manual_n05_preserves_full_seed_when_exa_contains_exact_evidence():
+    seed = "你说的对，但是《原神》是由米哈游自主研发的一款全新开放世界冒险游戏。"
+    sources = [
+        {
+            "source_id": "O001",
+            "url": "https://example.com/short-title",
+            "title": "你说的对，但是原神",
+            "text": "短标题页面",
+        },
+        {
+            "source_id": "O002",
+            "url": "https://example.com/full-source",
+            "title": "完整原句",
+            "text": f"网友原文：{seed}",
+        },
+    ]
+    registry = build_real_registry(
+        llm=FakeLLMProvider(responses=[{
+            "title": sources[0]["title"],
+            "original_text": sources[0]["title"],
+            "fixed_anchors": ["你说的对，但是"],
+            "source_id": "O001",
+            "source_url": sources[0]["url"],
+            "evidence_quote": sources[0]["title"],
+        }]),
+        search=FakeSearchProvider(),
+    )
+
+    result = await registry.get("N05").execute({
+        "START": {"mode": "MANUAL_SEED", "seed_text": seed},
+        "N04": {"sources": sources},
+    }, None)
+
+    selected = result["artifact"]["llm"]
+    assert selected["original_text"] == seed
+    assert selected["evidence_quote"] == seed
+    assert selected["source_id"] == "O002"
+    assert selected["source_url"] == sources[1]["url"]
+
+
+@pytest.mark.asyncio
+async def test_auto_n05_abandons_unverifiable_selection_instead_of_failing_run():
+    source = {
+        "source_id": "O001",
+        "url": "https://example.com/search-result",
+        "title": "无关搜索结果",
+        "text": "这段网页正文没有模型声称选中的原句。",
+    }
+    registry = build_real_registry(
+        llm=FakeLLMProvider(responses=[{
+            "title": "我反对这门亲事",
+            "original_text": "我反对这门亲事",
+            "fixed_anchors": ["我反对", "这门亲事"],
+            "source_id": "O999",
+            "source_url": "https://example.com/invented",
+            "evidence_quote": "我反对这门亲事",
+        }]),
+        search=FakeSearchProvider(),
+    )
+    context = RunContext(
+        mode=RunMode.AUTO_DISCOVERY,
+        admission_mode=AdmissionMode.AUTO,
+        strategy_snapshot={"search": {}},
+    )
+    services = {"strategy_snapshot": context.strategy_snapshot}
+
+    result = await registry.get("N05").execute({
+        "START": {"mode": "AUTO_DISCOVERY"},
+        "N02": {"known_example_phrases": ["我反对这门亲事"]},
+        "N04": {"sources": [source]},
+    }, services)
+
+    assert result["outcome"] == "ABANDON_ORIGINAL"
+    assert result["artifact"]["rejection_reason"] == "NO_VERIFIABLE_ORIGINAL_EVIDENCE"
+    assert context.exhausted_originals == ["我反对这门亲事"]
+    assert TransitionTable().next(
+        "N05", result["outcome"], mode=RunMode.AUTO_DISCOVERY.value,
+    ) == "N02"
 
 
 @pytest.mark.asyncio
@@ -1526,15 +1752,18 @@ async def test_n07_applied_directives_only_lists_queries_that_consumed_them():
     artifact = result["artifact"]
     queries = artifact["llm"]["queries"]
     assert artifact["applied_directives"] == directives[:2]
+    assert [item["directive"] for item in artifact["directive_query_mappings"]] == (
+        directives[:2]
+    )
     assert all(
-        any(directive in item["query"] for item in queries)
-        for directive in artifact["applied_directives"]
+        any(item["query_id"] == mapping["query_id"] for item in queries)
+        for mapping in artifact["directive_query_mappings"]
     )
     assert all(directives[2] not in item["query"] for item in queries)
 
 
 @pytest.mark.asyncio
-async def test_n07_claimed_long_directive_is_not_truncated_in_query():
+async def test_n07_translates_long_directive_to_short_query_and_keeps_audit_text():
     directive = "优先搜索论坛帖子和微博评论区中由真实网友发布的完整槽位替换文本，并排除百科释义、营销聚合页与原句转载"
     registry = build_real_registry(
         llm=FakeLLMProvider(), search=FakeSearchProvider(),
@@ -1553,7 +1782,17 @@ async def test_n07_claimed_long_directive_is_not_truncated_in_query():
 
     artifact = result["artifact"]
     assert artifact["applied_directives"] == [directive]
-    assert any(directive in item["query"] for item in artifact["llm"]["queries"])
+    mapping = artifact["directive_query_mappings"][0]
+    query = next(
+        item["query"] for item in artifact["llm"]["queries"]
+        if item["query_id"] == mapping["query_id"]
+    )
+    assert mapping["directive"] == directive
+    assert directive not in query
+    assert len(query) <= 80
+    assert "论坛" in query
+    assert "微博" in query
+    assert "网友改编" in query
 
 
 @pytest.mark.asyncio
@@ -1980,6 +2219,46 @@ async def test_n13_injects_and_audits_evaluation_strategy_directives():
 
 
 @pytest.mark.asyncio
+async def test_n13_normalizes_blank_problems_and_rejects_real_problems():
+    base_score = {
+        "fluency": 8,
+        "recognition": 8,
+        "agu_fit": 8,
+        "humor": 8,
+        "rhythm": 8,
+        "adaptation_restraint": 8,
+        "minimal_replacement_effect": 8,
+        "qualified": True,
+    }
+    llm = FakeLLMProvider(responses=[{
+        "scores": [
+            {**base_score, "candidate_id": "C1", "problems": ["", "  "]},
+            {**base_score, "candidate_id": "C2", "problems": ["语义仍不自然"]},
+        ],
+        "qualified_candidate_ids": ["C1", "C2"],
+    }])
+    registry = build_real_registry(llm=llm, search=FakeSearchProvider())
+
+    result = await registry.get("N13").execute({
+        "N12": {"candidates": [
+            {"candidate_id": "C1", "text": "他们正在凿agu"},
+            {"candidate_id": "C2", "text": "群友正在凿agu"},
+        ]},
+    }, None)
+
+    scores = {
+        score["candidate_id"]: score
+        for score in result["artifact"]["llm"]["scores"]
+    }
+    assert result["outcome"] == "HAS_QUALIFIED"
+    assert result["artifact"]["llm"]["qualified_candidate_ids"] == ["C1"]
+    assert scores["C1"]["problems"] == []
+    assert scores["C1"]["qualified"] is True
+    assert scores["C2"]["problems"] == ["语义仍不自然"]
+    assert scores["C2"]["qualified"] is False
+
+
+@pytest.mark.asyncio
 async def test_n13_awkward_candidate_cannot_pass_fluency_threshold():
     candidate_texts = {
         "C1": "我猜中了开头，却猜不中这凿agu",
@@ -2217,6 +2496,369 @@ async def test_n11_revalidates_template_coverage_without_llm_json_failure():
     assert payload["decision"] == "PASS"
     assert payload["matched_variant_count"] == 3
     assert llm.requests == []
+
+
+@pytest.mark.asyncio
+async def test_n11_counts_fullwidth_optional_slot_replacement_from_real_variant():
+    original = "小孩子才做选择题，成年人当然全都要"
+    variants = [
+        {"variant_text": "小孩子才做选择，本成年人，全都要"},
+        {
+            "variant_text": (
+                "这件衣服和那条裙子都好看，小孩子才做选择题，"
+                "成年人当然是全都要"
+            ),
+        },
+        {"variant_text": "小孩子才做选择，我全要"},
+    ]
+    registry = build_real_registry(
+        llm=FakeLLMProvider(), search=FakeSearchProvider(),
+    )
+
+    validated = await registry.get("N11").execute({
+        "N05": {"original_text": original},
+        "N09": {"variants": variants},
+        "N10": {
+            "canonical_template_text": (
+                "{前置情境（可选）}小孩子才做选择{变化内容}"
+            ),
+            "fixed_segments": ["小孩子才做选择"],
+            "slots": [
+                {"name": "前置情境（可选）"},
+                {"name": "变化内容"},
+            ],
+            "evidence_variant_texts": [
+                variant["variant_text"] for variant in variants
+            ],
+        },
+    }, None)
+
+    assert validated["outcome"] == "PASS", validated
+    assert validated["artifact"]["llm"]["problems"] == []
+
+
+@pytest.mark.asyncio
+async def test_child_choice_selection_suffix_uses_known_structure_and_passes_n11():
+    original = "小孩子才做选择题，成年人当然全都要"
+    raw_variants = [
+        {"variant_text": "小孩才做选择，我全都要", "source_url": "https://a"},
+        {"variant_text": "小孩才做选择，大人全都要", "source_url": "https://b"},
+        {"variant_text": "也写作小孩才做选择，大人全都要", "source_url": "https://c"},
+        {"variant_text": "小孩子才做选择，我都要", "source_url": "https://d"},
+        {
+            "variant_text": "小孩子才做选择呢，成年人什么都没有",
+            "source_url": "https://e",
+        },
+    ]
+    variants = real_registry._filter_verified_variants(
+        original, ["才做选择", "全都要"], raw_variants,
+    )
+    registry = build_real_registry(
+        llm=FakeLLMProvider(), search=FakeSearchProvider(),
+    )
+
+    extracted = await registry.get("N10").execute({
+        "N05": {"original_text": original},
+        "N09": {"variants": variants},
+    }, None)
+    validated = await registry.get("N11").execute({
+        "N05": {"original_text": original},
+        "N09": {"variants": variants},
+        "N10": extracted["artifact"],
+    }, None)
+
+    assert [variant["variant_text"] for variant in variants] == [
+        "小孩才做选择，我全都要",
+        "小孩才做选择，大人全都要",
+        "小孩才做选择，大人全都要",
+        "小孩子才做选择，我都要",
+        "小孩子才做选择呢，成年人什么都没有",
+    ]
+    assert extracted["artifact"]["extraction_mode"] == (
+        "VALIDATED_KNOWN_STRUCTURE"
+    )
+    assert extracted["artifact"]["llm"]["canonical_template_text"] == (
+        "{年幼者}才做选择{变化内容}"
+    )
+    assert validated["artifact"]["llm"]["problems"] == []
+    assert validated["outcome"] == "PASS", validated
+    assert validated["artifact"]["llm"]["coverage"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_child_choice_keeps_unsupported_prefix_fixed_and_passes_n11():
+    original = "小孩子才做选择，我全都要"
+    variants = [
+        {"variant_text": "小孩子才做选择题，成年人当然是全都要"},
+        {"variant_text": "小孩子才做选择题，大人全都要"},
+        {"variant_text": "小孩子才做选择，我都要"},
+        {"variant_text": "小孩子才做选择呢，成年人什么都没有"},
+    ]
+    registry = build_real_registry(
+        llm=FakeLLMProvider(), search=FakeSearchProvider(),
+    )
+
+    extracted = await registry.get("N10").execute({
+        "N05": {"original_text": original},
+        "N09": {"variants": variants},
+    }, None)
+    validated = await registry.get("N11").execute({
+        "N05": {"original_text": original},
+        "N09": {"variants": variants},
+        "N10": extracted["artifact"],
+    }, None)
+
+    assert extracted["artifact"]["llm"]["canonical_template_text"] == (
+        "小孩子才做选择{变化内容}"
+    )
+    assert extracted["artifact"]["llm"]["fixed_segments"] == [
+        "小孩子才做选择",
+    ]
+    assert validated["outcome"] == "PASS", validated
+    assert validated["artifact"]["llm"]["problems"] == []
+
+
+@pytest.mark.asyncio
+async def test_n11_accepts_verified_child_choice_template_with_four_char_anchor():
+    original = "小孩才做选择，我全都要"
+    variants = [
+        {"variant_text": "小孩子才做选择，大人全都要"},
+        {"variant_text": "小朋友才做选择，成年人全都要"},
+        {"variant_text": "小孩才做选择，本成年人全都要"},
+    ]
+    template = "{年幼者}才做选择，{主体}{全都要表达}"
+    registry = build_real_registry(
+        llm=FakeLLMProvider(), search=FakeSearchProvider(),
+    )
+
+    validated = await registry.get("N11").execute({
+        "N05": {"original_text": original},
+        "N09": {"variants": variants},
+        "N10": {
+            "canonical_template_text": template,
+            "fixed_segments": ["才做选择", "，"],
+            "slots": [
+                {"name": "年幼者"},
+                {"name": "主体"},
+                {"name": "全都要表达"},
+            ],
+            "evidence_variant_texts": [
+                variant["variant_text"] for variant in variants
+            ],
+        },
+    }, None)
+
+    assert validated["outcome"] == "PASS"
+    assert validated["artifact"]["llm"]["coverage"] == 1.0
+    assert validated["artifact"]["llm"]["problems"] == []
+
+
+def test_bold_demon_variant_filter_requires_actual_slot_replacement_shape():
+    original = "大胆妖孽，我一眼就看出你不是人！"
+    raw_variants = [
+        {
+            "variant_text": "大胆猫猫，我一眼就看出你不是人",
+            "source_url": "https://example.com/1",
+        },
+        {
+            "variant_text": "大胆程序员，我一眼就看出你不是产品经理",
+            "source_url": "https://example.com/2",
+        },
+        {
+            "variant_text": "|我一眼就看出你不是人，大胆妖孽，我要你原形毕露！|",
+            "source_url": "https://example.com/3",
+        },
+        {
+            "variant_text": "我一眼就看出你不是人！竟还敢对贫僧施魅惑之术",
+            "source_url": "https://example.com/4",
+        },
+        {
+            "variant_text": "我一眼就看出你不是人全文免费阅读_极天小说",
+            "source_url": "https://example.com/5",
+        },
+    ]
+
+    variants = real_registry._filter_verified_variants(
+        original, ["大胆", "我一眼就看出你不是人"], raw_variants,
+    )
+
+    assert [variant["variant_text"] for variant in variants] == [
+        "大胆猫猫，我一眼就看出你不是人",
+        "大胆程序员，我一眼就看出你不是产品经理",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_n10_defers_non_reconstructing_business_template_to_n11():
+    original = "大胆妖孽，我一眼就看出你不是人！"
+    variants = [
+        {"variant_text": "大胆猫猫，我一眼就看出你不是人"},
+        {"variant_text": "大胆程序员，我一眼就看出你不是产品经理"},
+        {"variant_text": "大胆机器人，我一眼就看出你不是人类"},
+    ]
+    llm = FakeLLMProvider(responses=[{
+        "canonical_template_text": "我一眼就看出你不是{身份}",
+        "fixed_segments": ["我一眼就看出你不是"],
+        "slots": [{"name": "身份"}],
+        "evidence_variant_texts": [
+            variant["variant_text"] for variant in variants
+        ],
+    }])
+    registry = build_real_registry(llm=llm, search=FakeSearchProvider())
+
+    extracted = await registry.get("N10").execute({
+        "N05": {"original_text": original},
+        "N09": {"variants": variants},
+    }, None)
+    validated = await registry.get("N11").execute({
+        "N05": {"original_text": original},
+        "N09": {"variants": variants},
+        "N10": extracted["artifact"],
+    }, None)
+
+    assert extracted["outcome"] == "TEMPLATE_READY"
+    assert extracted["artifact"]["prevalidation_issue"] == (
+        "N10 template does not reconstruct the selected original meme"
+    )
+    assert validated["outcome"] == "REEXTRACT"
+    assert "模板无法重建原句" in validated["artifact"]["llm"]["problems"]
+
+
+@pytest.mark.asyncio
+async def test_n10_corrects_structurally_invalid_template_before_failing_run():
+    original = "大胆妖孽，我一眼就看出你不是人"
+    variants = [
+        {"variant_text": "大胆猫猫，我一眼就看出你不是人"},
+        {"variant_text": "大胆程序员，我一眼就看出你不是产品经理"},
+        {"variant_text": "大胆机器人，我一眼就看出你不是人类"},
+    ]
+    llm = FakeLLMProvider(responses=[
+        {
+            "canonical_template_text": "{原梗}",
+            "fixed_segments": [],
+            "slots": [{"name": "原梗"}],
+            "evidence_variant_texts": [],
+        },
+        {
+            "canonical_template_text": (
+                "大胆{被呵斥对象}，我一眼就看出你不是{表面身份}"
+            ),
+            "fixed_segments": ["大胆", "，我一眼就看出你不是"],
+            "slots": [
+                {"name": "被呵斥对象"},
+                {"name": "表面身份"},
+            ],
+            "evidence_variant_texts": [
+                variant["variant_text"] for variant in variants
+            ],
+        },
+    ])
+    registry = build_real_registry(llm=llm, search=FakeSearchProvider())
+
+    result = await registry.get("N10").execute({
+        "N05": {"original_text": original},
+        "N09": {"variants": variants},
+    }, None)
+
+    assert result["outcome"] == "TEMPLATE_READY"
+    assert result["artifact"]["llm"]["canonical_template_text"].startswith(
+        "大胆{被呵斥对象}",
+    )
+    assert result["artifact"]["correction_attempts"] == 1
+    assert len(llm.requests) == 2
+    assert llm.requests[1].user_payload["validation_error"] == (
+        "N10 template must contain reusable slots and meaningful fixed structure"
+    )
+
+
+@pytest.mark.asyncio
+async def test_real_product_variant_shape_passes_template_validation():
+    original = "你说的对，但是《原神》是由米哈游自主研发的一款全新开放世界冒险游戏。"
+    raw_variants = [
+        {"variant_text": "你说的对，但是《你说的对》是由你说的对自主研发的一款全新你说的对", "source_url": "https://example.com/1"},
+        {"variant_text": "你说的对，但是《崩坏：星穹铁道》是由米哈游自主研发的一款全新回合制游戏", "source_url": "https://example.com/2"},
+        {"variant_text": "你说的对，但是……是由……自主研发的一款全新……，在这里，被……选中的……将被授予……之力", "source_url": "https://example.com/3"},
+        {"variant_text": "你说得对，但是Magisk是topjohnwu自主研发的一款全新安卓系统提权工具", "source_url": "https://example.com/4"},
+        {"variant_text": "你说的对，但是《崩坏：星穹铁道》是由米哈游自主研发的一款全新回合制游戏", "source_url": "https://example.com/5"},
+        {"variant_text": "Python：你说得对，但是《Python》是由吉多·范罗苏姆自主研发的一款全新面向对象编程语言", "source_url": "https://example.com/6"},
+        {"variant_text": "NOI：你说的对，但是《全国信息学奥林匹克竞赛》是由中国计算机学会自主研发的一款全新在线联机对战游戏", "source_url": "https://example.com/7"},
+        {"variant_text": "NOI 2版：你说的对，但是《NOI》是由CCF自主研发的一款全新开放世界冒险游戏", "source_url": "https://example.com/8"},
+    ]
+    variants = real_registry._filter_verified_variants(
+        original,
+        ["你说的对，但是", "是由", "自主研发的一款"],
+        raw_variants,
+    )
+    registry = build_real_registry(
+        llm=FakeLLMProvider(), search=FakeSearchProvider(),
+    )
+
+    extracted = await registry.get("N10").execute({
+        "N05": {"original_text": original},
+        "N09": {"variants": variants},
+    }, None)
+    validated = await registry.get("N11").execute({
+        "N05": {"original_text": original},
+        "N09": {"variants": variants},
+        "N10": extracted["artifact"],
+    }, None)
+
+    assert len(variants) == 7
+    assert all(
+        not variant["variant_text"].startswith(("Python：", "NOI：", "NOI 2版："))
+        for variant in variants
+    )
+    assert validated["outcome"] == "PASS"
+    assert validated["artifact"]["llm"]["matched_variant_count"] == 5
+    assert validated["artifact"]["llm"]["total_variant_count"] == 6
+    assert validated["artifact"]["llm"]["coverage"] == pytest.approx(5 / 6)
+
+
+@pytest.mark.asyncio
+async def test_traditional_child_choice_search_noise_yields_valid_template_evidence():
+    original = "小孩子才做選擇，我全都要"
+    texts = [
+        "Ａ：小朋友才做選擇，我全都要",
+        "圖中文字：IPhone13pro max 天鋒藍 apple電腦！ 小朋油才做選擇，我全都要",
+        "我全都要處方箋",
+        "或許是因為現代人頻繁地需要作出選擇，\"我全都要\" 成為了我們心中的夢想選擇",
+        "我全都要(樂高版) - kkkkking12的創作 - 巴哈姆特",
+        "許書豪新歌：「成熟的幼稚的，小朋友才要做選擇，大人的快樂，我全都要了",
+        "小朋友才做選擇我全都要",
+        "[爆卦]小朋友才做選擇我全都要英文是什麼？優點缺點精華區懶人包",
+    ]
+    raw_variants = [
+        {
+            "variant_text": text,
+            "source_url": f"https://example.com/{index}",
+        }
+        for index, text in enumerate(texts, 1)
+    ]
+    variants = real_registry._filter_verified_variants(
+        original, ["我全都要"], raw_variants,
+    )
+    registry = build_real_registry(
+        llm=FakeLLMProvider(), search=FakeSearchProvider(),
+    )
+
+    extracted = await registry.get("N10").execute({
+        "N05": {"original_text": original},
+        "N09": {"variants": variants},
+    }, None)
+    validated = await registry.get("N11").execute({
+        "N05": {"original_text": original},
+        "N09": {"variants": variants},
+        "N10": extracted["artifact"],
+    }, None)
+
+    assert [variant["variant_text"] for variant in variants] == [
+        "小朋友才做選擇，我全都要",
+        "小朋油才做選擇，我全都要",
+        "小朋友才做選擇我全都要",
+    ]
+    assert extracted["artifact"]["extraction_mode"] == "VALIDATED_KNOWN_STRUCTURE"
+    assert validated["outcome"] == "PASS"
+    assert validated["artifact"]["llm"]["coverage"] == 1.0
 
 
 @pytest.mark.asyncio
@@ -2701,6 +3343,47 @@ async def test_n09_and_n11_share_two_variant_search_retries_per_original():
 
 
 @pytest.mark.asyncio
+async def test_n11_reextract_is_bounded_by_the_shared_variant_retry_limit():
+    original = "我猜中了开头，却猜不中这结局"
+    context = RunContext(
+        mode=RunMode.MANUAL_SEED,
+        admission_mode=AdmissionMode.HUMAN,
+        strategy_snapshot={"search": {}},
+    )
+    services = {"strategy_snapshot": context.strategy_snapshot}
+    registry = build_real_registry(llm=FailingLLM(), search=FakeSearchProvider())
+    invalid_template_input = {
+        "N05": {"original_text": original},
+        "N09": {"variants": [
+            {"variant_text": "我猜中了起点，却猜不中这结局"},
+            {"variant_text": "我猜中了开头，却猜不中是谁先动的手"},
+            {"variant_text": "我猜中了开头，却猜不中群友最后凿了谁"},
+        ]},
+        "N10": {
+            "canonical_template_text": "{任意文本}",
+            "fixed_segments": [],
+            "slots": [{"name": "任意文本"}],
+            "evidence_variant_texts": [],
+        },
+    }
+
+    first = await registry.get("N11").execute(invalid_template_input, services)
+    second = await registry.get("N11").execute(invalid_template_input, services)
+    exhausted = await registry.get("N11").execute(invalid_template_input, services)
+
+    assert first["outcome"] == "REEXTRACT"
+    assert first["artifact"]["fallback"]["count"] == 1
+    assert second["outcome"] == "REEXTRACT"
+    assert second["artifact"]["fallback"]["count"] == 2
+    assert exhausted["outcome"] == "ABANDON_ORIGINAL"
+    assert exhausted["artifact"]["fallback"] == {
+        "count": 2,
+        "threshold": 2,
+        "reason": "N11_REEXTRACT",
+    }
+
+
+@pytest.mark.asyncio
 async def test_exhausted_original_tracking_keeps_other_original_counter_isolated():
     exhausted = "我猜中了开头，却猜不中这结局"
     different = "大胆妖孽，我一眼就看出你不是人"
@@ -2900,6 +3583,60 @@ async def test_n09_excludes_navigation_and_definition_text_from_all_want_variant
     texts = [item["variant_text"] for item in result["artifact"]["llm"]["variants"]]
     assert len(texts) == 3
     assert all("下载" not in text and "网络梗" not in text for text in texts)
+
+
+@pytest.mark.asyncio
+async def test_n09_excludes_question_site_suffix_and_novel_title_wrappers():
+    original = "小孩子才做选择题，成年人当然是全都要"
+    sources = [
+        {
+            "source_id": "V1", "url": "https://valid.example/1", "title": "网友改编1",
+            "text": "小孩子才做选择题，大人全都要",
+        },
+        {
+            "source_id": "V2", "url": "https://valid.example/2", "title": "网友改编2",
+            "text": "小孩子才做选择题，成年人当然是两边我全都要",
+        },
+        {
+            "source_id": "V3", "url": "https://valid.example/3", "title": "网友改编3",
+            "text": "小孩子才做选择呢，成年人什么都没有",
+        },
+        {
+            "source_id": "N1", "url": "https://noise.example/1", "title": "问答包装",
+            "text": "小孩子才做选择下一句是什么?小孩子才做选择下一句是成年人当然是全都要",
+        },
+        {
+            "source_id": "N2", "url": "https://noise.example/2", "title": "站点尾缀",
+            "text": "小孩子才做选择题，成年人当然全都要\\_搜狐汽车\\_搜狐网",
+        },
+        {
+            "source_id": "N3", "url": "https://noise.example/3", "title": "小说标题",
+            "text": "第110章 小孩子才做选择题，成年人当然全都要_全文免费阅读",
+        },
+    ]
+    model_variants = [{
+        "variant_text": source["text"],
+        "source_id": source["source_id"],
+        "source_url": source["url"],
+        "evidence_quote": source["text"],
+        "shared_anchor": "小孩子才做选择",
+    } for source in sources]
+    registry = build_real_registry(
+        llm=FakeLLMProvider(responses=[{"variants": model_variants}]),
+        search=FakeSearchProvider(),
+    )
+
+    result = await registry.get("N09").execute({
+        "N05": {
+            "original_text": original,
+            "fixed_anchors": ["小孩子才做选择", "全都要"],
+        },
+        "N08": {"sources": sources},
+    }, None)
+
+    texts = [item["variant_text"] for item in result["artifact"]["llm"]["variants"]]
+    assert texts == [source["text"] for source in sources[:3]]
+    assert result["artifact"]["llm"]["is_sufficient"] is True
 
 
 @pytest.mark.asyncio

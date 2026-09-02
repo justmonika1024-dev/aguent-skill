@@ -26,6 +26,7 @@ export interface RunSnapshot {
   formal_meme_id?: string | null
   started_at?: string
   ended_at?: string | null
+  retry_available?: boolean
 }
 
 export interface CurrentRunResponse {
