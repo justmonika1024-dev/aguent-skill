@@ -1,0 +1,6 @@
+interface:
+  display_name: "凿agugent 主管"
+  short_description: "贯穿搜索、证据、模板提取和生成评价的凿agu主管能力"
+  default_prompt: "使用 $zao-agugent-supervisor 执行一轮自主搜索并生成凿agu候选；若已附加浏览器插件则用其完成真实搜索，逐节点展示证据和判断。"
+policy:
+  allow_implicit_invocation: true
