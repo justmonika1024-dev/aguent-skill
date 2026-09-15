@@ -6,6 +6,8 @@
 
 ```yaml
 mode: AUTO | MANUAL_SEED
+source_scope: COMPLETE_MEME_UNIT # AUTO 固定值
+adaptation_mode: AUTO_ROUTE | STRICT_SLOT | LONG_FORM # AUTO 省略时 AUTO_ROUTE；MANUAL_SEED 省略时 STRICT_SLOT
 seed: null | {title, text, source_url?, notes?}
 formal_meme_titles: []
 strategy:
@@ -22,6 +24,12 @@ tools:
 ```
 
 这两个工具字段是期望能力，不是已验证事实。若字段缺失，主管可以使用保守默认值，但不得假装拥有搜索工具、数据库内容或人工评价；AUTO 必须由 S00 产生实测能力记录。
+
+`source_scope` 与 `adaptation_mode` 正交：前者说明改编对象覆盖什么，后者说明怎样改。AUTO 必须使用 `COMPLETE_MEME_UNIT`；短句和长段都可能完整。AUTO 的 `AUTO_ROUTE` 在 V06 依据真实变式选择模式；MANUAL_SEED 尊重用户显式模式。最终解析出的模式必须在后续实际节点及人工评价包内标明，避免长梗候选被当作已通过 V/T 严格模板审核。
+
+O05 的 `artifact.complete_reference` 必须完整实现 [完整原梗单元](complete-meme-unit.md) 的边界对象。后续每个结构、生成和评价节点增加 `complete_reference_ref`；只引用 `hook_text` 的输出不满足契约。
+
+真实运行使用 `complete_reference.completeness_status`；fixture 测试使用同对象内的 `fixture_completeness_status`，并保持真实状态为 `INCOMPLETE` 或未验证。V04/V05 的版本绑定字段及 V06 的重选流转见 [搜索与证据](search-evidence.md)。
 
 `preferred_search_provider` 也是期望而非能力证明。用户明确附加 `[@浏览器](plugin://browser@openai-bundled)` 时，将其视为 `CODEX_IN_APP_BROWSER` 的显式选择；若插件不可用必须阻塞，不得静默回退。浏览器调用记录格式见 [浏览器搜索适配器](browser-search.md)。
 
@@ -53,7 +61,7 @@ tools:
 
 搜索调用另存 `query / purpose / derivation / provider / request_id / result_refs / cost / latency / error`。不得只输出一个最终结论而丢失过程。
 
-每个实际执行或明确跳过的节点都必须有一份外壳；连续未到达节点可以用一份 `NOT_REACHED` 列表表示，但不能把不同节点合并成 `O01/O02`。AUTO 从 O02 开始，MANUAL_SEED 从 O01 开始。
+每个实际执行或明确跳过的节点都必须有一份外壳；连续未到达节点可以用一份 `NOT_REACHED` 列表表示，但不能把不同节点合并成 `O01/O02`。AUTO 从 O02 开始，MANUAL_SEED 从 O01 开始。交付机器记录时，每个已执行节点都要输出独立完整对象，显式含 `execution_mode`、`tool_call_refs` 与 `human_readable` 七字段；不能用表格列、共同字段声明或“可映射为”代替对象字段。若只是简报，标明它不是合约记录，并单独保存完整对象。
 
 ## 执行真实性
 
@@ -82,11 +90,11 @@ tools:
 2. 最终选定原始梗；
 3. 变式搜索计划；
 4. 最终变式搜索结果；
-5. 模板提取与槽位契约；
+5. 模板提取与槽位契约；`LONG_FORM` 改为完整参照版本、节奏骨架、实证可变位与推断编辑位；
 6. 正式梗候选集；
 7. 最终正式梗。
 
-每个模块提供 1～5 分结构化指标和可选文本意见。候选逐条评价通顺度、原梗辨识度、凿agu融合自然度、幽默度、模板逻辑、改编克制度、可用性；最终结果还评价是否为最佳候选。评价是下一轮的强制门槛，入库决定独立配置。
+每个模块提供 1～5 分结构化指标和可选文本意见。`STRICT_SLOT` 候选逐条评价通顺度、原梗辨识度、凿agu融合自然度、幽默度、模板逻辑、改编克制度、可用性；`LONG_FORM` 的模板逻辑改评参照节奏保留和推断编辑位诚实性，并额外关注施受关系。最终结果还评价是否为最佳候选。评价是下一轮的强制门槛，入库决定独立配置。
 
 ## 策略更新
 
