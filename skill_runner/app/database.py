@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -10,6 +10,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from .models import Base, FormalMeme, RunLog, RunRecord
+from .seed_data import CuratedExample
 
 
 def _text(value: Any) -> str:
@@ -151,6 +152,59 @@ class SQLiteRepository:
                 .limit(limit),
             )
             return list(result.scalars())
+
+    async def seed_completed_runs(
+        self,
+        examples: Sequence[CuratedExample],
+        run_root: Path,
+    ) -> int:
+        await self.init()
+        inserted = 0
+        async with self.session() as session, session.begin():
+            for example in examples:
+                if await session.get(RunRecord, example.run_id) is not None:
+                    continue
+                result = {
+                    "final_state": "WAITING_HUMAN_EVALUATION",
+                    "stop_node": "H02",
+                    "complete_reference": {
+                        "title": example.original_title,
+                        "complete_reference_text": example.original_text,
+                    },
+                    "final_draft": {
+                        "title": example.final_title,
+                        "text": example.final_text,
+                    },
+                }
+                meme = FormalMeme(
+                    id=example.formal_meme_id,
+                    source_run_id=example.run_id,
+                    original_title=example.original_title,
+                    original_text=example.original_text,
+                    final_title=example.final_title,
+                    final_text=example.final_text,
+                    evaluation_status="PASSED",
+                    evaluation_json=None,
+                    dynamic_example_eligible=True,
+                    created_at=example.completed_at,
+                )
+                run = RunRecord(
+                    id=example.run_id,
+                    mode=example.mode,
+                    seed_text=example.seed_text,
+                    status="WAITING_HUMAN_EVALUATION",
+                    workdir=str(run_root / example.run_id),
+                    started_at=example.completed_at,
+                    finished_at=example.completed_at,
+                    duration_seconds=0,
+                    codex_exit_code=0,
+                    result_json=result,
+                    formal_meme_id=example.formal_meme_id,
+                    created_at=example.completed_at,
+                )
+                session.add_all((run, meme))
+                inserted += 1
+        return inserted
 
     async def complete_success(
         self,

@@ -14,6 +14,7 @@ from .run_service import ActiveRunExists, RunService
 from .runners.base import AgentRunner
 from .runners.codex_cli import CodexCliRunner
 from .schemas import RunAccepted, RunCreate
+from .seed_data import CURATED_EXAMPLES
 
 
 def create_app(settings: Settings, runner: AgentRunner | None = None) -> FastAPI:
@@ -25,6 +26,7 @@ def create_app(settings: Settings, runner: AgentRunner | None = None) -> FastAPI
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         _validate_environment(settings, check_codex_command=runner is None)
         await repository.init()
+        await repository.seed_completed_runs(CURATED_EXAMPLES, settings.run_root)
         try:
             yield
         finally:

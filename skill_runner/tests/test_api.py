@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -127,3 +128,37 @@ async def test_startup_rejects_unusable_run_root(tmp_path):
     with pytest.raises(RuntimeError, match="RUN_ROOT"):
         async with app.router.lifespan_context(app):
             pass
+
+
+async def test_startup_seeds_curated_runs_once(tmp_path):
+    settings = make_settings(tmp_path)
+    first_app = create_app(settings, FakeRunner(VALID_RESULT))
+    async with first_app.router.lifespan_context(first_app):
+        first_titles = await first_app.state.repository.list_formal_titles()
+
+    second_app = create_app(settings, FakeRunner(VALID_RESULT))
+    async with second_app.router.lifespan_context(second_app):
+        second_titles = await second_app.state.repository.list_formal_titles()
+
+    assert len(first_titles) == 5
+    assert second_titles == first_titles
+
+
+async def test_auto_run_injects_three_curated_dynamic_examples(tmp_path):
+    settings = make_settings(tmp_path)
+    settings.dynamic_example_count = 3
+    runner = FakeRunner(VALID_RESULT)
+    app = create_app(settings, runner)
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test",
+        ) as http:
+            response = await http.post("/api/runs", json={"mode": "AUTO"})
+            assert response.status_code == 202
+            await app.state.run_service.wait_for_idle()
+
+    prompt = runner.calls[0][0]
+    example_json = prompt.split("AUTO 动态示例：\n\n```json\n", 1)[1].split("\n```", 1)[0]
+    examples = json.loads(example_json)
+    assert len(examples) == 3
+    assert all(item["original_text"] and item["final_text"] for item in examples)

@@ -4,6 +4,8 @@
 
 任务成功到达 `H02 / WAITING_HUMAN_EVALUATION` 后，运行结果立即写入 SQLite 正式梗库；是否能在后续 AUTO 轮次中作为动态示例，仍由 `dynamic_example_eligible` 字段控制，默认关闭。
 
+服务每次启动时会幂等确保数据库中存在 5 组此前实验中已认可的运行结果，包含 4 条短梗和 1 条完整长梗。这些记录使用普通的 `AUTO` 或 `MANUAL_SEED` 运行结构，正式梗评价状态为 `PASSED`，并可直接参与 AUTO 的随机动态示例；已有数据库会补齐缺失记录，重复启动不会重复写入。
+
 ## 运行要求
 
 - Python 3.12～3.14 和 [uv](https://docs.astral.sh/uv/)；
