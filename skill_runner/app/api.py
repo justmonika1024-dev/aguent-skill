@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import shutil
+import tempfile
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -21,6 +23,7 @@ def create_app(settings: Settings, runner: AgentRunner | None = None) -> FastAPI
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        _validate_environment(settings, check_codex_command=runner is None)
         await repository.init()
         try:
             yield
@@ -45,11 +48,24 @@ def create_app(settings: Settings, runner: AgentRunner | None = None) -> FastAPI
                 status_code=status.HTTP_409_CONFLICT,
                 content={
                     "error": {
-                    "code": "ACTIVE_RUN_EXISTS",
-                    "message": "another run is active",
+                        "code": "ACTIVE_RUN_EXISTS",
+                        "message": "another run is active",
                     },
                 },
             )
         return RunAccepted(run_id=run.id, status=run.status)
 
     return app
+
+
+def _validate_environment(settings: Settings, *, check_codex_command: bool) -> None:
+    if not (settings.skill_path / "SKILL.md").is_file():
+        raise RuntimeError(f"SKILL_PATH does not contain SKILL.md: {settings.skill_path}")
+    try:
+        settings.run_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=settings.run_root):
+            pass
+    except OSError as exc:
+        raise RuntimeError(f"RUN_ROOT is not writable: {settings.run_root}") from exc
+    if check_codex_command and shutil.which(settings.codex_command) is None:
+        raise RuntimeError(f"CODEX_COMMAND is not executable: {settings.codex_command}")

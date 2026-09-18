@@ -49,6 +49,7 @@ def test_auto_prompt_marks_dynamic_examples_as_non_evidence():
     )
 
     assert "mode: AUTO" in prompt
+    assert "adaptation_mode: AUTO_ROUTE" in prompt
     assert "已存在" in prompt
     assert "何以解忧？唯有杜康。" in prompt
     assert "何以解忧？唯有凿agu。" in prompt

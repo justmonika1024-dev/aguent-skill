@@ -23,6 +23,9 @@ def build_prompt(
         if request.mode is RunMode.MANUAL_SEED
         else "执行完整 AUTO_ROUTE 自主发现流程。"
     )
+    adaptation_mode = (
+        "\nadaptation_mode: AUTO_ROUTE" if request.mode is RunMode.AUTO else ""
+    )
     return f"""请使用当前仓库中的 `zao-agugent-supervisor` Skill 执行一轮真实任务。
 
 必须完整遵守 Skill 及其按当前分支要求加载的 references。每轮独立执行，不读取原工作区或用户记忆。{mode_guidance}
@@ -31,7 +34,7 @@ def build_prompt(
 
 ```yaml
 mode: {request.mode.value}
-source_scope: COMPLETE_MEME_UNIT
+source_scope: COMPLETE_MEME_UNIT{adaptation_mode}
 seed: {seed_block}
 formal_meme_titles: {_json(list(formal_titles))}
 limits:

@@ -94,3 +94,36 @@ async def test_no_read_endpoints_are_exposed(client):
     for path in ("/", "/api/runs", "/api/logs", "/api/formal-memes"):
         response = await http.get(path)
         assert response.status_code in {404, 405}
+
+
+async def test_startup_rejects_missing_skill(tmp_path):
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'runner.db'}",
+        run_root=tmp_path / "runs",
+        skill_path=tmp_path / "missing-skill",
+    )
+    app = create_app(settings, FakeRunner(VALID_RESULT))
+
+    with pytest.raises(RuntimeError, match="SKILL_PATH"):
+        async with app.router.lifespan_context(app):
+            pass
+
+
+async def test_startup_rejects_missing_codex_command(tmp_path):
+    settings = make_settings(tmp_path)
+    settings.codex_command = "codex-command-that-does-not-exist"
+    app = create_app(settings)
+
+    with pytest.raises(RuntimeError, match="CODEX_COMMAND"):
+        async with app.router.lifespan_context(app):
+            pass
+
+
+async def test_startup_rejects_unusable_run_root(tmp_path):
+    settings = make_settings(tmp_path)
+    settings.run_root.write_text("not a directory", encoding="utf-8")
+    app = create_app(settings, FakeRunner(VALID_RESULT))
+
+    with pytest.raises(RuntimeError, match="RUN_ROOT"):
+        async with app.router.lifespan_context(app):
+            pass
