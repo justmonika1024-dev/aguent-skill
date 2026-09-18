@@ -58,9 +58,24 @@ class SQLiteRepository:
     async def dispose(self) -> None:
         await self.engine.dispose()
 
-    async def create_run(self, mode: str, seed_text: str | None, workdir: str) -> RunRecord:
+    async def create_run(
+        self,
+        mode: str,
+        seed_text: str | None,
+        workdir: str,
+        *,
+        run_id: str | None = None,
+    ) -> RunRecord:
         await self.init()
-        row = RunRecord(mode=mode, seed_text=seed_text, workdir=workdir, status="PENDING")
+        values = {
+            "mode": mode,
+            "seed_text": seed_text,
+            "workdir": workdir,
+            "status": "PENDING",
+        }
+        if run_id is not None:
+            values["id"] = run_id
+        row = RunRecord(**values)
         async with self.session() as session, session.begin():
             session.add(row)
         return row
