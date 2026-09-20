@@ -3,10 +3,7 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .venv/
+.uv-cache/
 .env
 .worktrees/
-backend/data/*.db
-frontend/node_modules/
-frontend/dist/
-frontend/playwright-report/
-frontend/test-results/
+backend/data/

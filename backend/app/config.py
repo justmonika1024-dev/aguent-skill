@@ -1,23 +1,21 @@
 from pathlib import Path
 
-from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+BACKEND_ROOT = REPOSITORY_ROOT / "backend"
+
+
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=REPOSITORY_ROOT / ".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
-    llm_api_key: SecretStr
-    search_api_key: SecretStr | None = None
-    llm_provider: str = "fake"
-    search_provider: str = "fake"
-    database_url: str = "sqlite+aiosqlite:///./data/agugent.db"
-    openai_base_url: str | None = None
-    deepseek_base_url: str = "https://api.deepseek.com"
-    openai_model: str = "gpt-4o-mini"
-    deepseek_model: str = "deepseek-chat"
-    max_search_results: int = 10
-
-    @property
-    def database_path(self) -> Path:
-        return Path(self.database_url.removeprefix("sqlite+aiosqlite:///"))
+    database_url: str = f"sqlite+aiosqlite:///{BACKEND_ROOT / 'data/skill-runner.db'}"
+    run_root: Path = BACKEND_ROOT / "data/runs"
+    skill_path: Path = REPOSITORY_ROOT / "skill"
+    dynamic_example_count: int = 3
+    codex_command: str = "codex"
