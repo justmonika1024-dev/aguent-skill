@@ -16,18 +16,34 @@
 
 `backend/data/skill-runner.db` 保存任务、日志、评分和正式梗；`backend/data/runs/{run_id}` 保存每轮 Prompt、机器记录、搜索记录和最终摘要。`backend/data/` 不提交 Git。
 
-## 要求
+## 平台支持
 
-- macOS 或带桌面显示能力的运行环境；
+后端使用 FastAPI、SQLite 和跨平台 Python 接口，本身不依赖 macOS；完整任务还依赖 Codex CLI、Node.js、Git 以及有头 Chrome，因此“后端能够启动”不等于“AUTO 搜索链路已经验证”。当前支持状态如下：
+
+| 环境 | 当前状态 | 说明 |
+| --- | --- | --- |
+| macOS | 已验证 | 已完成 Codex CLI、Playwright、Chrome 和真实 AUTO 全链路测试 |
+| Linux 桌面 | 理论兼容，未验证 | 需要可用的 X11/Wayland 图形显示和 Google Chrome |
+| Linux 无桌面服务器 | 需要额外配置 | 当前有头 Chrome 不能直接在无 `DISPLAY` 环境启动，可配置 Xvfb 等虚拟显示后再验证 |
+| Windows 11 + WSL2/WSLg | 理论兼容，未验证 | 可使用现有 Bash 启动脚本，但 Codex CLI、Node.js、Git 和 Linux 版 Chrome 均须安装在 WSL 内 |
+| Windows 原生 PowerShell | 暂未开箱支持 | Codex CLI 官方支持 Windows，但本项目尚未提供 `start.ps1`，也未验证 `codex.cmd`、`npx.cmd` 和离屏 Chrome 行为 |
+
+未经真实全链路测试的平台不视为正式支持。Codex 本身的平台安装与 Windows 沙箱能力参见 [Codex CLI](https://learn.chatgpt.com/docs/codex/cli) 和 [Windows sandbox](https://learn.chatgpt.com/docs/windows/windows-sandbox)。
+
+## 共同要求
+
 - Python 3.12～3.14 和 [uv](https://docs.astral.sh/uv/)；
 - 已安装并登录 `codex` CLI；
 - Node.js 与 `npx` 可用；
+- Git 可用；
 - 已安装 Google Chrome；
 - 只启动一个服务进程，不要修改为多 worker。
 
-当前浏览器保持有头 Chrome 离屏运行方式。它仍可能在创建或切换标签页时短暂抢占前台，这是当前阶段保留的已知限制。
+当前浏览器固定使用有头 Chrome，并尝试把窗口移动到屏幕外。桌面环境中，它仍可能在创建或切换标签页时短暂抢占前台；Linux 服务器需要自行提供图形显示或虚拟显示。这是当前阶段保留的已知限制。
 
 ## 配置与启动
+
+### macOS、Linux 桌面和 WSL2
 
 首次使用：
 
@@ -53,6 +69,8 @@ http://127.0.0.1:8100
 ```bash
 AGUGENT_HOST=0.0.0.0 AGUGENT_PORT=8200 ./start.sh
 ```
+
+`start.sh` 使用 Bash，不能直接在 Windows PowerShell 中执行。Windows 原生启动脚本与完整搜索链路尚未实现和验证；如需在 Windows 上使用，当前优先建议 Windows 11 + WSL2/WSLg。
 
 根目录 `.env` 支持：
 
@@ -154,6 +172,8 @@ sqlite3 backend/data/skill-runner.db \
 
 ## 自测
 
+以下命令适用于 macOS、Linux 和 WSL，`/private/tmp` 是 Unix 临时目录：
+
 ```bash
 UV_CACHE_DIR=/private/tmp/zao-skill-runner-uv-cache \
   uv sync --project backend --extra dev --frozen
@@ -163,6 +183,15 @@ UV_CACHE_DIR=/private/tmp/zao-skill-runner-uv-cache \
 
 UV_CACHE_DIR=/private/tmp/zao-skill-runner-uv-cache \
   uv run --project backend python -m compileall -q backend/app backend/tests
+```
+
+Windows PowerShell 可以仅验证后端代码与 Fake Runner，不代表真实浏览器搜索链路已受支持：
+
+```powershell
+$env:UV_CACHE_DIR = Join-Path $env:TEMP "zao-skill-runner-uv-cache"
+uv sync --project backend --extra dev --frozen
+uv run --project backend pytest -q backend/tests
+uv run --project backend python -m compileall -q backend/app backend/tests
 ```
 
 默认测试使用 Fake Runner，不会调用 Codex、模型或网页。真实任务会产生模型调用和浏览器行为。
