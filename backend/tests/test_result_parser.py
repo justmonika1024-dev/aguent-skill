@@ -2,7 +2,12 @@ import json
 
 import pytest
 
-from app.result_parser import ResultError, extract_usage, parse_run_result
+from app.result_parser import (
+    ResultError,
+    extract_compact_metrics,
+    extract_usage,
+    parse_run_result,
+)
 
 
 def write_result(tmp_path, payload):
@@ -200,4 +205,63 @@ def test_extract_usage_uses_last_completed_turn():
         "cached_input_tokens": 8,
         "output_tokens": 2,
         "reasoning_tokens": 1,
+    }
+
+
+def test_extract_compact_metrics_maps_aggregate_multi_session_usage(tmp_path):
+    (tmp_path / "metrics.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "compact-round-metrics-v1",
+                "orchestrator_kind": "PROGRAMMATIC_NO_LLM_PARENT",
+                "token_usage": {
+                    "session_count": 5,
+                    "raw_input_tokens": 484842,
+                    "cached_input_tokens": 390272,
+                    "non_cached_input_tokens": 94570,
+                    "output_tokens": 8412,
+                    "reasoning_output_tokens": 2103,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert extract_compact_metrics(tmp_path) == {
+        "input_tokens": 484842,
+        "cached_input_tokens": 390272,
+        "output_tokens": 8412,
+        "reasoning_tokens": 2103,
+    }
+
+
+def test_extract_usage_preserves_last_compact_stage_when_metrics_file_is_missing():
+    events = [
+        {
+            "type": "compact.stage.completed",
+            "stage": "BOUNDARY_01",
+            "cumulative_usage": {
+                "input_tokens": 120,
+                "cached_input_tokens": 90,
+                "output_tokens": 12,
+                "reasoning_tokens": 4,
+            },
+        },
+        {
+            "type": "compact.stage.completed",
+            "stage": "VARIANTS_01",
+            "cumulative_usage": {
+                "input_tokens": 310,
+                "cached_input_tokens": 240,
+                "output_tokens": 31,
+                "reasoning_tokens": 9,
+            },
+        },
+    ]
+
+    assert extract_usage(events) == {
+        "input_tokens": 310,
+        "cached_input_tokens": 240,
+        "output_tokens": 31,
+        "reasoning_tokens": 9,
     }

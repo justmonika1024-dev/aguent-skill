@@ -13,7 +13,7 @@ from .database import SQLiteRepository
 from .run_status import build_run_status
 from .run_service import ActiveRunExists, RunService
 from .runners.base import AgentRunner
-from .runners.codex_cli import CodexCliRunner
+from .runners.compact_round import CompactRoundRunner
 from .schemas import (
     EvaluationCreate,
     EvaluationResult,
@@ -29,7 +29,10 @@ from .seed_data import CURATED_EXAMPLES
 
 def create_app(settings: Settings, runner: AgentRunner | None = None) -> FastAPI:
     repository = SQLiteRepository(settings.database_url)
-    selected_runner = runner or CodexCliRunner([settings.codex_command])
+    selected_runner = runner or CompactRoundRunner(
+        settings.skill_path,
+        settings.codex_command,
+    )
     service = RunService(settings, repository, selected_runner)
 
     @asynccontextmanager
@@ -142,6 +145,13 @@ def create_app(settings: Settings, runner: AgentRunner | None = None) -> FastAPI
 def _validate_environment(settings: Settings, *, check_codex_command: bool) -> None:
     if not (settings.skill_path / "SKILL.md").is_file():
         raise RuntimeError(f"SKILL_PATH does not contain SKILL.md: {settings.skill_path}")
+    if check_codex_command and not (
+        settings.skill_path / "scripts" / "compact_round_runner.py"
+    ).is_file():
+        raise RuntimeError(
+            "SKILL_PATH does not contain scripts/compact_round_runner.py: "
+            f"{settings.skill_path}"
+        )
     try:
         settings.run_root.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(dir=settings.run_root):

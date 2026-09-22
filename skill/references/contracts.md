@@ -8,6 +8,7 @@
 mode: AUTO | MANUAL_SEED
 source_scope: COMPLETE_MEME_UNIT # AUTO 固定值
 adaptation_mode: AUTO_ROUTE | STRICT_SLOT | LONG_FORM # AUTO 省略时 AUTO_ROUTE；MANUAL_SEED 省略时 STRICT_SLOT
+generation_mode: null # G01 后解析为 STRICT_FILL | CONTROLLED_REWRITE；LONG_FORM 分支为 LONG_FORM
 seed: null | {title, text, source_url?, notes?}
 formal_meme_titles: []
 strategy:
@@ -23,9 +24,25 @@ tools:
   preferred_search_provider: CODEX_IN_APP_BROWSER | EXA | OTHER | null
 ```
 
+完整运行另记录：
+
+```yaml
+search_execution_mode: COMPACT_WORKERS | SINGLE_SESSION_FALLBACK
+token_usage:
+  parent: {raw_input, cached_input, non_cached_input, output, reasoning_output}
+  workers: {raw_input, cached_input, non_cached_input, output, reasoning_output, session_count}
+  total: {raw_input, cached_input, non_cached_input, output, reasoning_output}
+```
+
+使用 `COMPACT_WORKERS` 时，必须保存精简包、程序差异覆盖、每个 worker 的结果与 JSONL 调用记录。handoff 不创造新的 `execution_mode` 枚举：真实网页调用仍为 `TOOL_EXECUTED`，聚合脚本也以其命令记录作为 `tool_call_refs`。
+
 这两个工具字段是期望能力，不是已验证事实。若字段缺失，主管可以使用保守默认值，但不得假装拥有搜索工具、数据库内容或人工评价；AUTO 必须由 S00 产生实测能力记录。
 
 `source_scope` 与 `adaptation_mode` 正交：前者说明改编对象覆盖什么，后者说明怎样改。AUTO 必须使用 `COMPLETE_MEME_UNIT`；短句和长段都可能完整。AUTO 的 `AUTO_ROUTE` 在 V06 依据真实变式选择模式；MANUAL_SEED 尊重用户显式模式。最终解析出的模式必须在后续实际节点及人工评价包内标明，避免长梗候选被当作已通过 V/T 严格模板审核。
+
+`generation_mode` 不是第四种 `adaptation_mode`。它只记录模板/节奏证据确认后的生成实现：严格槽位可直接承载事件时为 `STRICT_FILL`；严格模板已确认、但只有一次实体槽替换加一次共指局部谓词联动才能自然成立时为 `CONTROLLED_REWRITE`；长梗分支为 `LONG_FORM`。在 G01/L04 之前保持 `null`，不得提前指定它来绕过证据门禁。
+
+G01 的机器字段 `outcome` 必须精确为 `SUITABLE_STRICT | CONTROLLED_REWRITE_CANDIDATE | NOT_SUITABLE`，禁止用“可直接承载”“建议受控改写”等自然语言代替。`generation_mode` 仅在前两者分别解析为 `STRICT_FILL`、`CONTROLLED_REWRITE`；`NOT_SUITABLE` 时仍为 `null`。
 
 O05 的 `artifact.complete_reference` 必须完整实现 [完整原梗单元](complete-meme-unit.md) 的边界对象。后续每个结构、生成和评价节点增加 `complete_reference_ref`；只引用 `hook_text` 的输出不满足契约。
 
@@ -94,7 +111,7 @@ O05 的 `artifact.complete_reference` 必须完整实现 [完整原梗单元](co
 6. 正式梗候选集；
 7. 最终正式梗。
 
-每个模块提供 1～5 分结构化指标和可选文本意见。`STRICT_SLOT` 候选逐条评价通顺度、原梗辨识度、凿agu融合自然度、幽默度、模板逻辑、改编克制度、可用性；`LONG_FORM` 的模板逻辑改评参照节奏保留和推断编辑位诚实性，并额外关注施受关系。最终结果还评价是否为最佳候选。评价是下一轮的强制门槛，入库决定独立配置。
+每个模块提供 1～5 分结构化指标和可选文本意见。`STRICT_SLOT` 候选逐条评价通顺度、原梗辨识度、凿agu融合自然度、幽默度、模板逻辑、改编克制度、可用性；当 `generation_mode=CONTROLLED_REWRITE` 时，候选集和最终结果还必须评价联动改写必要性、固定锚点保留度，并以布尔项记录是否超出改动预算。`LONG_FORM` 的模板逻辑改评参照节奏保留和推断编辑位诚实性，并额外关注施受关系。最终结果还评价是否为最佳候选。评价是下一轮的强制门槛，入库决定独立配置。
 
 ## 策略更新
 

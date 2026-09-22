@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import shutil
+import json
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
@@ -10,9 +10,13 @@ from uuid import uuid4
 from .config import Settings
 from .database import SQLiteRepository
 from .models import RunRecord
-from .prompt_builder import build_prompt
-from .result_parser import ResultError, extract_usage, parse_run_result
-from .runners.base import AgentRunner
+from .result_parser import (
+    ResultError,
+    extract_compact_metrics,
+    extract_usage,
+    parse_run_result,
+)
+from .runners.base import AgentRunner, RunInvocation
 from .schemas import DynamicExample, RunCreate, RunMode
 
 
@@ -58,8 +62,26 @@ class RunService:
                     )
                     for row in rows
                 ]
-            prompt = build_prompt(request, titles, examples)
-            (workdir / "prompt.md").write_text(prompt, encoding="utf-8")
+            invocation = RunInvocation(
+                mode=request.mode.value,
+                seed_text=request.seed_text,
+                formal_titles=tuple(titles),
+                dynamic_examples=tuple(example.model_dump() for example in examples),
+            )
+            (workdir / "run-input.json").write_text(
+                json.dumps(
+                    {
+                        "mode": invocation.mode,
+                        "seed_text": invocation.seed_text,
+                        "formal_titles": list(invocation.formal_titles),
+                        "dynamic_examples": list(invocation.dynamic_examples),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
             run = await self.repository.create_run(
                 request.mode.value,
                 request.seed_text,
@@ -67,7 +89,7 @@ class RunService:
                 run_id=run_id,
             )
             self._active_task = asyncio.create_task(
-                self._execute(run_id, prompt, workdir),
+                self._execute(run_id, invocation, workdir),
                 name=f"skill-run-{run_id}",
             )
             return run
@@ -81,14 +103,7 @@ class RunService:
             await asyncio.shield(task)
 
     async def _prepare_workdir(self, workdir: Path) -> None:
-        skill_destination = workdir / ".agents/skills/zao-agugent-supervisor"
         workdir.mkdir(parents=True, exist_ok=False)
-        await asyncio.to_thread(
-            shutil.copytree,
-            self.settings.skill_path,
-            skill_destination,
-            ignore=shutil.ignore_patterns(".git"),
-        )
         process = await asyncio.create_subprocess_exec(
             "git",
             "init",
@@ -102,7 +117,12 @@ class RunService:
             message = stderr.decode("utf-8", errors="replace").strip()
             raise RuntimeError(f"cannot initialize run repository: {message}")
 
-    async def _execute(self, run_id: str, prompt: str, workdir: Path) -> None:
+    async def _execute(
+        self,
+        run_id: str,
+        invocation: RunInvocation,
+        workdir: Path,
+    ) -> None:
         sequence = 0
         sequence_lock = asyncio.Lock()
 
@@ -116,6 +136,10 @@ class RunService:
             async with sequence_lock:
                 if event_type == "turn.completed" and payload is not None:
                     await self.repository.update_usage(run_id, extract_usage([payload]))
+                elif event_type == "compact.stage.completed" and payload is not None:
+                    cumulative = payload.get("cumulative_usage")
+                    if isinstance(cumulative, dict):
+                        await self.repository.update_usage(run_id, cumulative)
                 sequence += 1
                 await self.repository.append_log(
                     run_id,
@@ -131,18 +155,28 @@ class RunService:
         try:
             await self.repository.mark_running(run_id, datetime.now(UTC))
             await log_sink("SYSTEM", "run.started", {"run_id": run_id}, None)
-            runner_result = await self.runner.run(prompt, workdir, log_sink)
+            runner_result = await self.runner.run(invocation, workdir, log_sink)
             exit_code = runner_result.exit_code
             duration_seconds = max(0, round(runner_result.duration_seconds))
+            usage = (
+                extract_compact_metrics(workdir)
+                if (workdir / "metrics.json").is_file()
+                else extract_usage(runner_result.events)
+            )
+            await self.repository.update_usage(run_id, usage)
+            parsed = (
+                parse_run_result(workdir)
+                if (workdir / "run-result.json").is_file()
+                else None
+            )
             if exit_code != 0:
                 raise ResultError(
                     "CLI_EXIT_NON_ZERO",
                     f"Codex CLI exited with status {exit_code}",
                 )
 
-            parsed = parse_run_result(workdir)
+            parsed = parsed or parse_run_result(workdir)
             result = self._normalized_result(parsed.raw, parsed)
-            usage = extract_usage(runner_result.events)
             await self.repository.complete_success(
                 run_id,
                 result,

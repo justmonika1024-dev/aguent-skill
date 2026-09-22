@@ -14,7 +14,9 @@
 └── README.md
 ```
 
-`backend/data/skill-runner.db` 保存任务、日志、评分和正式梗；`backend/data/runs/{run_id}` 保存每轮 Prompt、机器记录、搜索记录和最终摘要。`backend/data/` 不提交 Git。
+`backend/data/skill-runner.db` 保存任务、日志、评分和正式梗；`backend/data/runs/{run_id}` 保存结构化输入、精简搜索交接、机器记录、搜索记录、汇总指标和最终摘要。`backend/data/` 不提交 Git。
+
+正式接口使用程序化外层编排器，而不是让一个长对话负责搜索、等待和生成。每轮会拆成多个一次性短会话：搜索 worker 只保留裁剪后的有效证据，最后由一个全新的无网络主管会话完成模板、候选和正式梗生成。搜索正文和旧会话历史不会反复带入后续调用，从而降低 Token 消耗。
 
 ## 平台支持
 
@@ -110,9 +112,9 @@ curl -sS -X POST 'http://127.0.0.1:8100/api/runs' \
 curl -sS 'http://127.0.0.1:8100/api/runs/{run_id}'
 ```
 
-运行中会返回当前状态、已用时、Codex CLI 当前已经上报的 Token 统计、最近一条人类可读动态，以及已经确认的原始梗、模板和正式梗。尚未形成的产物为 `null`。
+运行中会返回当前状态、已用时、各个已完成短会话的累计 Token 统计、最近一个编排阶段的人类可读动态，以及已经确认的原始梗、模板和正式梗。尚未形成的产物为 `null`。
 
-`token_usage.finalized=false` 表示 Codex CLI 尚未返回本轮最终用量；单次 Codex 调用通常只在 `turn.completed` 时上报精确统计。任务结束后 `finalized=true`，并一次返回终态产物；失败任务同时返回 `error` 和 `stop_reason`。
+`token_usage.finalized=false` 表示本轮仍有短会话尚未结束；每个阶段结束后会更新一次累计精确统计。任务结束后以 `metrics.json` 中全部阶段的汇总值为准并返回 `finalized=true`；失败任务也保留失败前已经消耗的 Token，同时返回 `error` 和 `stop_reason`。
 
 示例结构：
 
@@ -178,11 +180,13 @@ sqlite3 backend/data/skill-runner.db \
 UV_CACHE_DIR=/private/tmp/zao-skill-runner-uv-cache \
   uv sync --project backend --extra dev --frozen
 
-UV_CACHE_DIR=/private/tmp/zao-skill-runner-uv-cache \
-  uv run --project backend pytest -q backend/tests
+cd backend
 
 UV_CACHE_DIR=/private/tmp/zao-skill-runner-uv-cache \
-  uv run --project backend python -m compileall -q backend/app backend/tests
+  uv run pytest -q
+
+UV_CACHE_DIR=/private/tmp/zao-skill-runner-uv-cache \
+  uv run python -m compileall -q app tests
 ```
 
 Windows PowerShell 可以仅验证后端代码与 Fake Runner，不代表真实浏览器搜索链路已受支持：
@@ -190,8 +194,10 @@ Windows PowerShell 可以仅验证后端代码与 Fake Runner，不代表真实�
 ```powershell
 $env:UV_CACHE_DIR = Join-Path $env:TEMP "zao-skill-runner-uv-cache"
 uv sync --project backend --extra dev --frozen
-uv run --project backend pytest -q backend/tests
-uv run --project backend python -m compileall -q backend/app backend/tests
+Push-Location backend
+uv run pytest -q
+uv run python -m compileall -q app tests
+Pop-Location
 ```
 
 默认测试使用 Fake Runner，不会调用 Codex、模型或网页。真实任务会产生模型调用和浏览器行为。

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -27,7 +27,7 @@ def _artifact(value: Any, *, text_keys: tuple[str, ...]) -> RunArtifact | None:
     text = next((_text(payload.get(key)) for key in text_keys if _text(payload.get(key))), "")
     if not text:
         return None
-    title = _text(payload.get("title")) or text[:80]
+    title = _text(payload.get("title") or payload.get("hook_text")) or text[:80]
     return RunArtifact(title=title, text=text)
 
 
@@ -35,6 +35,11 @@ def _template(result: Mapping[str, Any]) -> str | None:
     direct = _text(result.get("template"))
     if direct:
         return direct
+    structured = _mapping(result.get("template"))
+    for field in ("pattern", "rendering", "template", "skeleton"):
+        value = _text(structured.get(field))
+        if value:
+            return value
     for package_key in (
         "template_package",
         "template_hypothesis",
@@ -46,6 +51,19 @@ def _template(result: Mapping[str, Any]) -> str | None:
             value = _text(package.get(field))
             if value:
                 return value
+    long_form_plan = _mapping(result.get("long_form_plan"))
+    rhythm_skeleton = long_form_plan.get("rhythm_skeleton")
+    if isinstance(rhythm_skeleton, Sequence) and not isinstance(
+        rhythm_skeleton,
+        (str, bytes),
+    ):
+        functions = [
+            _text(_mapping(item).get("function"))
+            for item in rhythm_skeleton
+        ]
+        readable = " → ".join(item for item in functions if item)
+        if readable:
+            return readable
     return None
 
 
@@ -69,6 +87,10 @@ def _elapsed_seconds(run: RunRecord, now: datetime) -> int:
 def _latest_agent_message(logs: list[RunLog]) -> str:
     for log in reversed(logs):
         payload = _mapping(log.payload_json)
+        if str(payload.get("type") or "").startswith("compact.stage."):
+            message = _text(payload.get("message"))
+            if message:
+                return message
         item = _mapping(payload.get("item"))
         if item.get("type") == "agent_message":
             message = _text(item.get("text"))
@@ -78,15 +100,23 @@ def _latest_agent_message(logs: list[RunLog]) -> str:
 
 
 async def build_run_status(run: RunRecord, logs: list[RunLog]) -> RunStatus:
-    progress = await asyncio.to_thread(
-        _read_progress,
-        Path(run.workdir) / "progress.json",
+    workdir = Path(run.workdir)
+    progress, boundary = await asyncio.gather(
+        asyncio.to_thread(_read_progress, workdir / "progress.json"),
+        asyncio.to_thread(
+            _read_progress,
+            workdir / "search-handoff" / "boundary-result.json",
+        ),
     )
     result = _mapping(run.result_json)
+    verified_boundary = boundary if boundary.get("status") == "VERIFIED" else {}
 
     original = _artifact(
         progress.get("original_meme"),
         text_keys=("text", "complete_reference_text"),
+    ) or _artifact(
+        verified_boundary,
+        text_keys=("complete_reference_text", "text"),
     ) or _artifact(
         result.get("complete_reference"),
         text_keys=("complete_reference_text", "text"),

@@ -18,6 +18,18 @@ class RunnerResult:
     events: Sequence[dict[str, Any]]
 
 
-class AgentRunner(Protocol):
-    async def run(self, prompt: str, workdir: Path, log_sink: LogSink) -> RunnerResult: ...
+@dataclass(frozen=True)
+class RunInvocation:
+    mode: str
+    seed_text: str | None = None
+    formal_titles: Sequence[str] = ()
+    dynamic_examples: Sequence[dict[str, Any]] = ()
 
+
+class AgentRunner(Protocol):
+    async def run(
+        self,
+        invocation: RunInvocation,
+        workdir: Path,
+        log_sink: LogSink,
+    ) -> RunnerResult: ...

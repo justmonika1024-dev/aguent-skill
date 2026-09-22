@@ -33,9 +33,8 @@ async def test_start_prepares_isolated_workdir_and_rejects_parallel_run(reposito
     assert run.status == "PENDING"
     workdir = Path(run.workdir)
     assert workdir == settings.run_root / run.id
-    assert (workdir / ".agents/skills/zao-agugent-supervisor/SKILL.md").is_file()
     assert (workdir / ".git").is_dir()
-    assert (workdir / "prompt.md").is_file()
+    assert (workdir / "run-input.json").is_file()
     with pytest.raises(ActiveRunExists):
         await service.start(RunCreate(mode="AUTO"))
 
@@ -85,6 +84,32 @@ async def test_failure_paths_do_not_store_formal_meme(
     assert await repository.get_formal_meme_by_run(run.id) is None
 
 
+async def test_nonzero_compact_stop_preserves_skill_reason(repository, tmp_path):
+    runner = FakeRunner(
+        {
+            "final_state": "INSUFFICIENT_EVIDENCE",
+            "stop_node": "V06",
+            "stop_reasons": [
+                "V04_SOURCE_KIND_MISMATCH",
+                "STRICT_VARIANT_CONTENT_GROUP_COVERAGE_BELOW_TWO",
+            ],
+        },
+        exit_code=1,
+    )
+    service = RunService(make_settings(tmp_path), repository, runner)
+
+    run = await service.start(RunCreate(mode="MANUAL_SEED", seed_text="种子"))
+    await service.wait_for_idle()
+
+    stored = await repository.get_run(run.id)
+    assert stored is not None
+    assert stored.error_code == "SKILL_STOPPED_WITHOUT_RESULT"
+    assert stored.skill_stop_reason == (
+        "V04_SOURCE_KIND_MISMATCH; "
+        "STRICT_VARIANT_CONTENT_GROUP_COVERAGE_BELOW_TWO"
+    )
+
+
 async def test_auto_prompt_uses_only_eligible_dynamic_examples(repository, tmp_path):
     eligible_run = await repository.create_run("AUTO", None, "/tmp/eligible")
     ineligible_run = await repository.create_run("AUTO", None, "/tmp/ineligible")
@@ -113,11 +138,12 @@ async def test_auto_prompt_uses_only_eligible_dynamic_examples(repository, tmp_p
     await service.start(RunCreate(mode="AUTO"))
     await service.wait_for_idle()
 
-    prompt = runner.calls[0][0]
-    assert "何以解忧？唯有杜康。" in prompt
-    assert "何以解忧？唯有凿agu。" in prompt
-    assert "不要注入的原文" not in prompt
-    assert "不要注入" in prompt  # all formal titles are still injected for dedupe
+    invocation = runner.calls[0][0]
+    examples = list(invocation.dynamic_examples)
+    assert any(example["original_text"] == "何以解忧？唯有杜康。" for example in examples)
+    assert any(example["final_text"] == "何以解忧？唯有凿agu。" for example in examples)
+    assert all(example["original_text"] != "不要注入的原文" for example in examples)
+    assert "不要注入" in invocation.formal_titles  # all titles remain available for dedupe
 
 
 async def test_logs_are_persisted_from_runner(repository, tmp_path):
@@ -131,3 +157,18 @@ async def test_logs_are_persisted_from_runner(repository, tmp_path):
     assert any(row.stream == "STDOUT" and row.event_type == "turn.completed" for row in logs)
     assert any(row.stream == "STDERR" and row.raw_text == "fixture stderr" for row in logs)
     assert any(row.stream == "SYSTEM" for row in logs)
+
+
+async def test_compact_stage_usage_updates_running_and_final_usage(repository, tmp_path):
+    runner = FakeRunner(VALID_RESULT, compact_usage=True)
+    service = RunService(make_settings(tmp_path), repository, runner)
+
+    run = await service.start(RunCreate(mode="AUTO"))
+    await service.wait_for_idle()
+
+    stored = await repository.get_run(run.id)
+    assert stored is not None
+    assert stored.input_tokens == 484842
+    assert stored.cached_input_tokens == 390272
+    assert stored.output_tokens == 8412
+    assert stored.reasoning_tokens == 2103

@@ -14,8 +14,9 @@ from tests.fakes import FakeRunner, VALID_RESULT
 
 def make_settings(tmp_path: Path) -> Settings:
     skill = tmp_path / "source-skill"
-    skill.mkdir()
+    (skill / "scripts").mkdir(parents=True)
     (skill / "SKILL.md").write_text("# fixture skill\n", encoding="utf-8")
+    (skill / "scripts/compact_round_runner.py").write_text("pass\n", encoding="utf-8")
     return Settings(
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'runner.db'}",
         run_root=tmp_path / "runs",
@@ -210,6 +211,63 @@ class UsageThenBlockedRunner:
         return RunnerResult(exit_code=0, duration_seconds=1, events=[event])
 
 
+class CompactProgressRunner:
+    def __init__(self) -> None:
+        self.reported = anyio.Event()
+        self.release = anyio.Event()
+
+    async def run(self, invocation, workdir: Path, log_sink):
+        handoff = workdir / "search-handoff"
+        handoff.mkdir()
+        (handoff / "boundary-result.json").write_text(
+            json.dumps(
+                {
+                    "status": "VERIFIED",
+                    "hook_text": "何以解忧",
+                    "complete_reference_text": "何以解忧？唯有杜康。",
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        event = {
+            "type": "compact.stage.started",
+            "stage": "VARIANTS_01",
+            "message": "正在执行精简阶段 VARIANTS_01",
+        }
+        await log_sink("STDOUT", event["type"], event, None)
+        self.reported.set()
+        await self.release.wait()
+        (workdir / "run-result.json").write_text(
+            json.dumps(VALID_RESULT, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return RunnerResult(exit_code=0, duration_seconds=1, events=[])
+
+
+async def test_running_compact_stage_reports_activity_and_verified_original(tmp_path):
+    runner = CompactProgressRunner()
+    app = create_app(make_settings(tmp_path), runner)
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test",
+        ) as http:
+            created = await http.post("/api/runs", json={"mode": "AUTO"})
+            await runner.reported.wait()
+
+            response = await http.get(f"/api/runs/{created.json()['run_id']}")
+            runner.release.set()
+            await app.state.run_service.wait_for_idle()
+
+    payload = response.json()
+    assert payload["status"] == "RUNNING"
+    assert payload["latest_activity"] == "正在执行精简阶段 VARIANTS_01"
+    assert payload["original_meme"] == {
+        "title": "何以解忧",
+        "text": "何以解忧？唯有杜康。",
+    }
+
+
 async def test_running_status_exposes_latest_reported_usage(tmp_path):
     runner = UsageThenBlockedRunner()
     app = create_app(make_settings(tmp_path), runner)
@@ -325,6 +383,22 @@ async def test_startup_rejects_missing_codex_command(tmp_path):
             pass
 
 
+async def test_startup_rejects_skill_without_compact_orchestrator(tmp_path):
+    skill = tmp_path / "source-skill"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text("# fixture skill\n", encoding="utf-8")
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'runner.db'}",
+        run_root=tmp_path / "runs",
+        skill_path=skill,
+    )
+    app = create_app(settings)
+
+    with pytest.raises(RuntimeError, match="compact_round_runner.py"):
+        async with app.router.lifespan_context(app):
+            pass
+
+
 async def test_startup_rejects_unusable_run_root(tmp_path):
     settings = make_settings(tmp_path)
     settings.run_root.write_text("not a directory", encoding="utf-8")
@@ -362,9 +436,8 @@ async def test_auto_run_injects_three_curated_dynamic_examples(tmp_path):
             assert response.status_code == 202
             await app.state.run_service.wait_for_idle()
 
-    prompt = runner.calls[0][0]
-    example_json = prompt.split("AUTO 动态示例：\n\n```json\n", 1)[1].split("\n```", 1)[0]
-    examples = json.loads(example_json)
+    invocation = runner.calls[0][0]
+    examples = list(invocation.dynamic_examples)
     assert len(examples) == 3
     assert all(item["original_text"] and item["final_text"] for item in examples)
     assert all(item["score"] == 0 for item in examples)

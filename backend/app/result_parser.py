@@ -32,6 +32,12 @@ def _clean(value: Any) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
+def _stop_reason_list(value: Any) -> str:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return ""
+    return "; ".join(item for item in (_clean(entry) for entry in value) if item)
+
+
 def _node_artifact(payload: Mapping[str, Any], node_key: str) -> Mapping[str, Any]:
     nodes = payload.get("nodes")
     if not isinstance(nodes, Sequence) or isinstance(nodes, (str, bytes)):
@@ -76,7 +82,7 @@ def parse_run_result(workdir: Path) -> ParsedRunResult:
             payload.get("stop_reason")
             or payload.get("termination_reason")
             or stop.get("reason")
-        )
+        ) or _stop_reason_list(payload.get("stop_reasons"))
         if not stop_reason:
             stop_reason = f"{stop_node or 'UNKNOWN'} {final_state or 'UNKNOWN'}"
         raise ResultError(
@@ -123,7 +129,15 @@ def parse_run_result(workdir: Path) -> ParsedRunResult:
 def extract_usage(events: Sequence[Mapping[str, Any]]) -> dict[str, int]:
     usage: Mapping[str, Any] = {}
     for event in events:
-        if event.get("type") == "turn.completed" and isinstance(event.get("usage"), Mapping):
+        if event.get("type") == "compact.stage.completed" and isinstance(
+            event.get("cumulative_usage"),
+            Mapping,
+        ):
+            usage = event["cumulative_usage"]
+        elif event.get("type") == "turn.completed" and isinstance(
+            event.get("usage"),
+            Mapping,
+        ):
             usage = event["usage"]
     return {
         "input_tokens": int(usage.get("input_tokens", 0) or 0),
@@ -132,4 +146,24 @@ def extract_usage(events: Sequence[Mapping[str, Any]]) -> dict[str, int]:
         "reasoning_tokens": int(
             usage.get("reasoning_tokens", usage.get("reasoning_output_tokens", 0)) or 0
         ),
+    }
+
+
+def extract_compact_metrics(workdir: Path) -> dict[str, int]:
+    path = workdir / "metrics.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ResultError("METRICS_INVALID", f"cannot parse metrics.json: {exc}") from exc
+    token_usage = _mapping(_mapping(payload).get("token_usage"))
+    if payload.get("orchestrator_kind") != "PROGRAMMATIC_NO_LLM_PARENT":
+        raise ResultError(
+            "METRICS_INVALID",
+            "metrics.json is not from the programmatic compact orchestrator",
+        )
+    return {
+        "input_tokens": int(token_usage.get("raw_input_tokens", 0) or 0),
+        "cached_input_tokens": int(token_usage.get("cached_input_tokens", 0) or 0),
+        "output_tokens": int(token_usage.get("output_tokens", 0) or 0),
+        "reasoning_tokens": int(token_usage.get("reasoning_output_tokens", 0) or 0),
     }
