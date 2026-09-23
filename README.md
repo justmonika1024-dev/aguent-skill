@@ -84,6 +84,42 @@ AGUGENT_HOST=0.0.0.0 AGUGENT_PORT=8200 ./start.sh
 | `DYNAMIC_EXAMPLE_COUNT` | `3` | AUTO 动态示例数量 |
 | `CODEX_COMMAND` | `codex` | Codex CLI 命令 |
 
+### 使用独立的 Codex 模型提供方
+
+默认情况下，服务内启动的 `codex exec` 会继承当前用户的 Codex 配置和鉴权信息，即读取默认 `CODEX_HOME` 下的 `config.toml`。Playwright 搜索仍由本机浏览器执行，切换模型提供方不会改变搜索方式。
+
+如果只想让本服务使用另一组模型、Base URL 和 Token，而不影响其他 Codex 项目，推荐为服务准备独立的 Codex 配置目录：
+
+```bash
+mkdir -p .codex-service
+```
+
+创建 `.codex-service/config.toml`：
+
+```toml
+model_provider = "agugent_provider"
+model = "你的模型ID"
+model_reasoning_effort = "medium"
+
+[model_providers.agugent_provider]
+name = "Agugent Provider"
+base_url = "https://你的服务地址/v1"
+wire_api = "responses"
+env_key = "AGUGENT_PROVIDER_API_KEY"
+requires_openai_auth = false
+```
+
+然后在启动服务的同一个终端中导出 Token，并指定该配置目录：
+
+```bash
+export AGUGENT_PROVIDER_API_KEY='你的Token'
+CODEX_HOME="$PWD/.codex-service" ./start.sh
+```
+
+`model` 必须是该提供方实际支持的模型 ID，提供方必须兼容 OpenAI Responses API。Codex 自定义提供方当前只支持 `wire_api = "responses"`；仅提供 `/chat/completions` 的兼容接口不能直接用于这条调用链。配置字段可参考 [Codex Advanced Configuration](https://learn.chatgpt.com/docs/config-file/config-advanced) 和 [Codex Configuration Reference](https://learn.chatgpt.com/docs/config-file/config-reference)。
+
+不要把真实 Token 写入 `config.toml` 或提交到 Git。项目当前的 `.env` 只由后端配置类读取，不会把任意新增的提供方 Token 自动导出给 `codex` 子进程，因此只在 `.env` 中增加 `AGUGENT_PROVIDER_API_KEY` 并不会生效。需要切换提供方时，停止现有服务，并使用上述环境变量重新启动。
+
 ## 接口
 
 ### POST /api/runs：启动任务
